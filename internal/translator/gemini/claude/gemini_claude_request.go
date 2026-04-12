@@ -169,9 +169,38 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 	}
 
 	// tools
+	// Parse tool_choice before translating tools because it affects whether Claude web_search
+	// should be exposed to Gemini at all.
+	toolChoiceResult := gjson.GetBytes(rawJSON, "tool_choice")
+	toolChoiceType := ""
+	toolChoiceName := ""
+	if toolChoiceResult.Exists() {
+		if toolChoiceResult.IsObject() {
+			toolChoiceType = toolChoiceResult.Get("type").String()
+			toolChoiceName = toolChoiceResult.Get("name").String()
+		} else if toolChoiceResult.Type == gjson.String {
+			toolChoiceType = toolChoiceResult.String()
+		}
+	}
+	// Gemini cannot force googleSearch directly. When Claude forces web_search, the closest
+	// equivalent is to keep search available while disabling function calling below.
+	onlySearch := false
+
 	if toolsResult := gjson.GetBytes(rawJSON, "tools"); toolsResult.IsArray() {
-		hasTools := false
+		functionToolsNode := []byte(`{"functionDeclarations":[]}`)
+		hasGoogleSearch := false
+		hasFunctionTools := false
 		toolsResult.ForEach(func(_, toolResult gjson.Result) bool {
+			if isClaudeWebSearchTool(toolResult) {
+				if shouldIncludeTool(toolResult, toolChoiceType, toolChoiceName) {
+					hasGoogleSearch = true
+				}
+				if toolChoiceType == "tool" && isToolChosen(toolResult, toolChoiceName) {
+					onlySearch = true
+				}
+				return true
+			}
+
 			inputSchemaResult := toolResult.Get("input_schema")
 			if inputSchemaResult.Exists() && inputSchemaResult.IsObject() {
 				inputSchema := util.CleanJSONSchemaForGemini(inputSchemaResult.Raw)
@@ -193,32 +222,28 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				tool, _ = sjson.DeleteBytes(tool, "eager_input_streaming")
 				tool, _ = sjson.SetBytes(tool, "name", util.SanitizeFunctionName(gjson.GetBytes(tool, "name").String()))
 				if gjson.ValidBytes(tool) && gjson.ParseBytes(tool).IsObject() {
-					if !hasTools {
-						out, _ = sjson.SetRawBytes(out, "tools", []byte(`[{"functionDeclarations":[]}]`))
-						hasTools = true
-					}
-					out, _ = sjson.SetRawBytes(out, "tools.0.functionDeclarations.-1", tool)
+					functionToolsNode, _ = sjson.SetRawBytes(functionToolsNode, "functionDeclarations.-1", tool)
+					hasFunctionTools = true
 				}
 			}
 			return true
 		})
-		if !hasTools {
-			out, _ = sjson.DeleteBytes(out, "tools")
+
+		if hasFunctionTools || hasGoogleSearch {
+			toolsNode := []byte(`[]`)
+			if hasFunctionTools {
+				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", functionToolsNode)
+			}
+			if hasGoogleSearch {
+				// Gemini search is declared as its own tool entry rather than a functionDeclaration.
+				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", []byte(`{"googleSearch":{}}`))
+			}
+			out, _ = sjson.SetRawBytes(out, "tools", toolsNode)
 		}
 	}
 
 	// tool_choice
-	toolChoiceResult := gjson.GetBytes(rawJSON, "tool_choice")
 	if toolChoiceResult.Exists() {
-		toolChoiceType := ""
-		toolChoiceName := ""
-		if toolChoiceResult.IsObject() {
-			toolChoiceType = toolChoiceResult.Get("type").String()
-			toolChoiceName = toolChoiceResult.Get("name").String()
-		} else if toolChoiceResult.Type == gjson.String {
-			toolChoiceType = toolChoiceResult.String()
-		}
-
 		switch toolChoiceType {
 		case "auto":
 			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "AUTO")
@@ -227,9 +252,15 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		case "any":
 			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
 		case "tool":
-			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
-			if toolChoiceName != "" {
-				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.allowedFunctionNames", []string{util.SanitizeFunctionName(toolChoiceName)})
+			if onlySearch {
+				// Keep declared functions untouched, but prevent Gemini from selecting any function
+				// when Claude explicitly forces the built-in web search tool.
+				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+			} else {
+				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
+				if toolChoiceName != "" {
+					out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.allowedFunctionNames", []string{util.SanitizeFunctionName(toolChoiceName)})
+				}
 			}
 		}
 	}
@@ -291,4 +322,26 @@ func toolNameFromClaudeToolUseID(toolUseID string) string {
 		return ""
 	}
 	return strings.Join(parts[0:len(parts)-1], "-")
+}
+
+func isClaudeWebSearchTool(toolResult gjson.Result) bool {
+	return strings.HasPrefix(toolResult.Get("type").String(), "web_search")
+}
+
+func isToolChosen(toolResult gjson.Result, toolChoiceName string) bool {
+	return toolResult.Get("name").String() == toolChoiceName
+}
+
+func shouldIncludeTool(toolResult gjson.Result, toolChoiceType, toolChoiceName string) bool {
+	switch toolChoiceType {
+	case "none":
+		return false
+	case "tool":
+		if toolChoiceName == "" {
+			return true
+		}
+		return isToolChosen(toolResult, toolChoiceName)
+	default:
+		return true
+	}
 }

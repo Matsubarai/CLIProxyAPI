@@ -648,10 +648,15 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
+			filtered := helps.FilterSSEUsageMetadata(line)
+			payload := helps.JSONPayload(filtered)
+			if len(payload) == 0 {
+				continue
+			}
+			if detail, ok := helps.ParseGeminiStreamUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(payload), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}
@@ -777,10 +782,15 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseGeminiStreamUsage(line); ok {
+			filtered := helps.FilterSSEUsageMetadata(line)
+			payload := helps.JSONPayload(filtered)
+			if len(payload) == 0 {
+				continue
+			}
+			if detail, ok := helps.ParseGeminiStreamUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			}
-			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
+			lines := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(payload), &param)
 			for i := range lines {
 				out <- cliproxyexecutor.StreamChunk{Payload: lines[i]}
 			}
