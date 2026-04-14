@@ -295,12 +295,12 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 
 	// tools -> tools[].functionDeclarations + tools[].googleSearch/codeExecution/urlContext passthrough
 	tools := gjson.GetBytes(rawJSON, "tools")
+	functionToolNode := []byte(`{}`)
+	hasFunction := false
+	googleSearchNodes := make([][]byte, 0)
+	codeExecutionNodes := make([][]byte, 0)
+	urlContextNodes := make([][]byte, 0)
 	if tools.IsArray() && len(tools.Array()) > 0 {
-		functionToolNode := []byte(`{}`)
-		hasFunction := false
-		googleSearchNodes := make([][]byte, 0)
-		codeExecutionNodes := make([][]byte, 0)
-		urlContextNodes := make([][]byte, 0)
 		for _, t := range tools.Array() {
 			if t.Get("type").String() == "function" {
 				fn := t.Get("function")
@@ -357,7 +357,11 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					hasFunction = true
 				}
 			}
-			if gs := t.Get("google_search"); gs.Exists() {
+			gs := t.Get("google_search")
+			if !gs.Exists() {
+				gs = t.Get("googleSearch")
+			}
+			if gs.Exists() {
 				googleToolNode := []byte(`{}`)
 				var errSet error
 				googleToolNode, errSet = sjson.SetRawBytes(googleToolNode, "googleSearch", []byte(gs.Raw))
@@ -388,22 +392,27 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				urlContextNodes = append(urlContextNodes, urlToolNode)
 			}
 		}
-		if hasFunction || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
-			toolsNode := []byte("[]")
-			if hasFunction {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", functionToolNode)
-			}
-			for _, googleNode := range googleSearchNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", googleNode)
-			}
-			for _, codeNode := range codeExecutionNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", codeNode)
-			}
-			for _, urlNode := range urlContextNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", urlNode)
-			}
-			out, _ = sjson.SetRawBytes(out, "tools", toolsNode)
+	}
+
+	if shouldTranslateWebSearchOptionsToGemini(rawJSON) && len(googleSearchNodes) == 0 {
+		googleSearchNodes = append(googleSearchNodes, []byte(`{"googleSearch":{}}`))
+	}
+
+	if hasFunction || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
+		toolsNode := []byte("[]")
+		if hasFunction {
+			toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", functionToolNode)
 		}
+		for _, googleNode := range googleSearchNodes {
+			toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", googleNode)
+		}
+		for _, codeNode := range codeExecutionNodes {
+			toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", codeNode)
+		}
+		for _, urlNode := range urlContextNodes {
+			toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", urlNode)
+		}
+		out, _ = sjson.SetRawBytes(out, "tools", toolsNode)
 	}
 
 	out = common.AttachDefaultSafetySettings(out, "safetySettings")
@@ -413,3 +422,8 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 
 // itoa converts int to string without strconv import for few usages.
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
+
+func shouldTranslateWebSearchOptionsToGemini(rawJSON []byte) bool {
+	webSearchOptions := gjson.GetBytes(rawJSON, "web_search_options")
+	return webSearchOptions.Exists() && webSearchOptions.Type != gjson.Null
+}

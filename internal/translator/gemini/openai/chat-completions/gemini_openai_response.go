@@ -25,6 +25,7 @@ type convertGeminiResponseToOpenAIChatParams struct {
 	// FunctionIndex tracks tool call indices per candidate index to support multiple candidates.
 	FunctionIndex    map[int]int
 	SanitizedNameMap map[string]string
+	VisibleText      map[int]*strings.Builder
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -51,6 +52,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 			UnixTimestamp:    0,
 			FunctionIndex:    make(map[int]int),
 			SanitizedNameMap: util.SanitizedToolNameMap(originalRequestRawJSON),
+			VisibleText:      make(map[int]*strings.Builder),
 		}
 	}
 
@@ -62,6 +64,9 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	if p.SanitizedNameMap == nil {
 		p.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
 	}
+	if p.VisibleText == nil {
+		p.VisibleText = make(map[int]*strings.Builder)
+	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
 		rawJSON = bytes.TrimSpace(rawJSON[5:])
@@ -72,8 +77,8 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	}
 
 	// Initialize the OpenAI SSE base template.
-	// We use a base template and clone it for each candidate to support multiple candidates.
-	baseTemplate := []byte(`{"id":"","object":"chat.completion.chunk","created":12345,"model":"model","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null,"native_finish_reason":null}]}`)
+	// We use an empty delta object so absent streaming fields are omitted instead of serialized as null.
+	baseTemplate := []byte(`{"id":"","object":"chat.completion.chunk","created":12345,"model":"model","choices":[{"index":0,"delta":{}}]}`)
 
 	// Extract and set the model version.
 	if modelVersionResult := gjson.GetBytes(rawJSON, "modelVersion"); modelVersionResult.Exists() {
@@ -134,6 +139,11 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 			// Set the specific index for this candidate.
 			candidateIndex := int(candidate.Get("index").Int())
 			template, _ = sjson.SetBytes(template, "choices.0.index", candidateIndex)
+			visibleText := p.VisibleText[candidateIndex]
+			if visibleText == nil {
+				visibleText = &strings.Builder{}
+				p.VisibleText[candidateIndex] = visibleText
+			}
 
 			finishReason := ""
 			if stopReasonResult := gjson.GetBytes(rawJSON, "stop_reason"); stopReasonResult.Exists() {
@@ -179,6 +189,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 							template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", text)
 						} else {
 							template, _ = sjson.SetBytes(template, "choices.0.delta.content", text)
+							visibleText.WriteString(text)
 						}
 						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 					} else if functionCallResult.Exists() {
@@ -229,6 +240,15 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						imagePayload, _ = sjson.SetBytes(imagePayload, "image_url.url", imageURL)
 						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 						template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
+					}
+				}
+			}
+			if groundingMetadata := candidate.Get("groundingMetadata"); groundingMetadata.Exists() {
+				annotations := buildOpenAIAnnotationsFromGroundingMetadata(visibleText.String(), groundingMetadata)
+				if len(annotations) > 0 {
+					template, _ = sjson.SetRawBytes(template, "choices.0.delta.annotations", []byte(`[]`))
+					for _, annotation := range annotations {
+						template, _ = sjson.SetRawBytes(template, "choices.0.delta.annotations.-1", annotation)
 					}
 				}
 			}
@@ -402,6 +422,15 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 			if hasFunctionCall {
 				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "finish_reason", "tool_calls")
 				choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "native_finish_reason", "tool_calls")
+			}
+			if groundingMetadata := candidate.Get("groundingMetadata"); groundingMetadata.Exists() {
+				annotations := buildOpenAIAnnotationsFromGroundingMetadata(gjson.GetBytes(choiceTemplate, "message.content").String(), groundingMetadata)
+				if len(annotations) > 0 {
+					choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.annotations", []byte(`[]`))
+					for _, annotation := range annotations {
+						choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.annotations.-1", annotation)
+					}
+				}
 			}
 
 			// Append the constructed choice to the main choices array.

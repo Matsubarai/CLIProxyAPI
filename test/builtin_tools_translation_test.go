@@ -46,3 +46,23 @@ func TestOpenAIResponsesToOpenAI_IgnoresBuiltinTools(t *testing.T) {
 		t.Fatalf("expected 0 tools (builtin tools not supported in Chat Completions), got %d: %s", got, string(out))
 	}
 }
+
+func TestOpenAIToGemini_TranslatesWebSearchOptionsToGoogleSearch(t *testing.T) {
+	in := []byte(`{
+		"model":"gpt-5",
+		"messages":[{"role":"user","content":"latest headline"}],
+		"web_search_options":{"search_context_size":"high"}
+	}`)
+
+	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAI, sdktranslator.FormatGemini, "gemini-2.5-flash", in, false)
+
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("expected 1 tool, got %d: %s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "tools.0.googleSearch").Exists() {
+		t.Fatalf("expected tools[0].googleSearch to exist: %s", string(out))
+	}
+	if gjson.GetBytes(out, "tools.0.googleSearch.search_context_size").Exists() {
+		t.Fatalf("did not expect search_context_size to be forwarded: %s", string(out))
+	}
+}
