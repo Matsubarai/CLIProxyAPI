@@ -73,3 +73,37 @@ func TestConvertOpenAIResponsesRequestToGemini_ForcedWebSearchDisablesFunctionCa
 		t.Fatalf("functionCallingConfig.mode = %q, want %q: %s", got, "NONE", string(output))
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToGemini_MapsDeveloperMessagesToSystemInstruction(t *testing.T) {
+	input := []byte(`{
+		"model":"gpt-5",
+		"instructions":"baseline policy",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"reply tersely"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToGemini("gemini-2.5-flash", input, false)
+
+	if got := gjson.GetBytes(output, "systemInstruction.parts.0.text").String(); got != "baseline policy" {
+		t.Fatalf("systemInstruction.parts[0].text = %q, want %q: %s", got, "baseline policy", string(output))
+	}
+	if got := gjson.GetBytes(output, "systemInstruction.parts.1.text").String(); got != "reply tersely" {
+		t.Fatalf("systemInstruction.parts[1].text = %q, want %q: %s", got, "reply tersely", string(output))
+	}
+	if got := gjson.GetBytes(output, "contents.#").Int(); got != 1 {
+		t.Fatalf("contents count = %d, want 1: %s", got, string(output))
+	}
+	if got := gjson.GetBytes(output, "contents.0.role").String(); got != "user" {
+		t.Fatalf("contents[0].role = %q, want %q: %s", got, "user", string(output))
+	}
+	if got := gjson.GetBytes(output, "contents.0.parts.0.text").String(); got != "hi" {
+		t.Fatalf("contents[0].parts[0].text = %q, want %q: %s", got, "hi", string(output))
+	}
+	for _, content := range gjson.GetBytes(output, "contents").Array() {
+		if got := content.Get("role").String(); got == "developer" {
+			t.Fatalf("did not expect Gemini contents role=developer: %s", string(output))
+		}
+	}
+}
