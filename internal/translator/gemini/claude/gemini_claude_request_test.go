@@ -137,6 +137,45 @@ func TestConvertClaudeRequestToGemini_WebSearchToolMappedToGoogleSearch(t *testi
 	}
 }
 
+func TestConvertClaudeRequestToGemini_WebSearchBlockedDomainsMappedToExcludeDomains(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-flash-preview",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "Find recent AI news."}
+				]
+			}
+		],
+		"tools": [
+			{
+				"type": "web_search_20250305",
+				"name": "web_search",
+				"blocked_domains": ["example.com", "news.example.com"]
+			}
+		],
+		"tool_choice": {"type": "auto"}
+	}`)
+
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	tools := gjson.GetBytes(output, "tools").Array()
+	if len(tools) != 1 {
+		t.Fatalf("Expected only googleSearch tool, got %d: %s", len(tools), string(output))
+	}
+	if !gjson.GetBytes(output, "tools.0.googleSearch").Exists() {
+		t.Fatalf("Expected googleSearch tool in output: %s", string(output))
+	}
+
+	excludeDomains := gjson.GetBytes(output, "tools.0.googleSearch.exclude_domains").Array()
+	if len(excludeDomains) != 2 || excludeDomains[0].String() != "example.com" || excludeDomains[1].String() != "news.example.com" {
+		t.Fatalf("Expected exclude_domains to mirror blocked_domains, got %s", gjson.GetBytes(output, "tools.0.googleSearch.exclude_domains").Raw)
+	}
+	if gjson.GetBytes(output, "tools.0.googleSearch.blocked_domains").Exists() {
+		t.Fatalf("Did not expect blocked_domains to remain in googleSearch: %s", string(output))
+	}
+}
+
 func TestConvertClaudeRequestToGemini_CodeExecutionToolMappedToGeminiCodeExecution(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3-flash-preview",

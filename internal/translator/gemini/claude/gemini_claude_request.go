@@ -190,6 +190,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 	if toolsResult := gjson.GetBytes(rawJSON, "tools"); toolsResult.IsArray() {
 		functionToolsNode := []byte(`{"functionDeclarations":[]}`)
 		hasGoogleSearch := false
+		var googleSearchToolNode []byte
 		hasCodeExecution := false
 		hasFunctionTools := false
 		toolsResult.ForEach(func(_, toolResult gjson.Result) bool {
@@ -198,6 +199,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				// dedicated top-level googleSearch tool entry.
 				if shouldIncludeTool(toolResult, toolChoiceType, toolChoiceName) {
 					hasGoogleSearch = true
+					googleSearchToolNode = buildGeminiGoogleSearchTool(toolResult)
 				}
 				if toolChoiceType == "tool" && isToolChosen(toolResult, toolChoiceName) {
 					onlyServerTool = true
@@ -252,7 +254,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			}
 			if hasGoogleSearch {
 				// Gemini search is declared as its own tool entry rather than a functionDeclaration.
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", []byte(`{"googleSearch":{}}`))
+				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", googleSearchToolNode)
 			}
 			if hasCodeExecution {
 				// Gemini code execution is declared as its own tool entry rather than a functionDeclaration.
@@ -348,6 +350,14 @@ func toolNameFromClaudeToolUseID(toolUseID string) string {
 
 func isClaudeWebSearchTool(toolResult gjson.Result) bool {
 	return strings.HasPrefix(toolResult.Get("type").String(), "web_search")
+}
+
+func buildGeminiGoogleSearchTool(toolResult gjson.Result) []byte {
+	googleSearchToolNode := []byte(`{"googleSearch":{}}`)
+	if blockedDomains := toolResult.Get("blocked_domains"); blockedDomains.Exists() && blockedDomains.IsArray() {
+		googleSearchToolNode, _ = sjson.SetRawBytes(googleSearchToolNode, "googleSearch.exclude_domains", []byte(blockedDomains.Raw))
+	}
+	return googleSearchToolNode
 }
 
 func isClaudeCodeExecutionTool(toolResult gjson.Result) bool {
