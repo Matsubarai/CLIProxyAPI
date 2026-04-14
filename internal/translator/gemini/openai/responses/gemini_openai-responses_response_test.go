@@ -1,9 +1,12 @@
 package responses
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 )
@@ -349,5 +352,272 @@ func TestConvertGeminiResponseToOpenAIResponses_ResponseOutputOrdering(t *testin
 	}
 	if !(posMsgAdded < posCompleted) {
 		t.Fatalf("expected response.completed after message added: msgAdded=%d completed=%d", posMsgAdded, posCompleted)
+	}
+}
+
+func TestConvertGeminiResponseToOpenAIResponsesNonStream_GroundingMetadataAddsSearchCallAndAnnotations(t *testing.T) {
+	originalReq := []byte(`{
+		"model":"gpt-5",
+		"tools":[{"type":"web_search"}]
+	}`)
+	rawJSON := []byte(`{
+		"responseId":"resp_grounded",
+		"modelVersion":"gemini-2.5-flash",
+		"candidates":[{
+			"content":{"role":"model","parts":[{"text":"Alpha beta"}]},
+			"finishReason":"STOP",
+			"groundingMetadata":{
+				"webSearchQueries":["Alpha beta source"],
+				"groundingChunks":[
+					{"web":{"uri":"https://example.com/a","title":"Example A"}}
+				],
+				"groundingSupports":[
+					{"segment":{"startIndex":0,"endIndex":10,"text":"Alpha beta"},"groundingChunkIndices":[0]}
+				]
+			}
+		}]
+	}`)
+
+	output := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "gemini-2.5-flash", originalReq, nil, rawJSON, nil)
+
+	if got := gjson.GetBytes(output, "output.0.type").String(); got != "web_search_call" {
+		t.Fatalf("output[0].type = %q, want %q: %s", got, "web_search_call", string(output))
+	}
+	if got := gjson.GetBytes(output, "output.0.action.type").String(); got != "search" {
+		t.Fatalf("output[0].action.type = %q, want %q: %s", got, "search", string(output))
+	}
+	if got := gjson.GetBytes(output, "output.0.action.queries.0").String(); got != "Alpha beta source" {
+		t.Fatalf("output[0].action.queries[0] = %q, want %q: %s", got, "Alpha beta source", string(output))
+	}
+	if got := gjson.GetBytes(output, "output.1.type").String(); got != "message" {
+		t.Fatalf("output[1].type = %q, want %q: %s", got, "message", string(output))
+	}
+	if got := gjson.GetBytes(output, "output.1.content.0.annotations.0.type").String(); got != "url_citation" {
+		t.Fatalf("annotations[0].type = %q, want %q: %s", got, "url_citation", string(output))
+	}
+	if got := gjson.GetBytes(output, "output.1.content.0.annotations.0.start_index").Int(); got != 0 {
+		t.Fatalf("annotations[0].start_index = %d, want 0: %s", got, string(output))
+	}
+	if got := gjson.GetBytes(output, "output.1.content.0.annotations.0.end_index").Int(); got != 10 {
+		t.Fatalf("annotations[0].end_index = %d, want 10: %s", got, string(output))
+	}
+}
+
+func TestConvertGeminiResponseToOpenAIResponsesNonStream_GroundingSourcesFollowInclude(t *testing.T) {
+	originalReq := []byte(`{
+		"model":"gpt-5",
+		"tools":[{"type":"web_search_preview"}],
+		"include":["web_search_call.action.sources"]
+	}`)
+	rawJSON := []byte(`{
+		"responseId":"resp_grounded_sources",
+		"modelVersion":"gemini-2.5-flash",
+		"candidates":[{
+			"content":{"role":"model","parts":[{"text":"Alpha beta"}]},
+			"finishReason":"STOP",
+			"groundingMetadata":{
+				"webSearchQueries":["Alpha beta source"],
+				"groundingChunks":[
+					{"web":{"uri":"https://example.com/a","title":"Example A"}}
+				],
+				"groundingSupports":[
+					{"segment":{"startIndex":0,"endIndex":10,"text":"Alpha beta"},"groundingChunkIndices":[0]}
+				]
+			}
+		}]
+	}`)
+
+	output := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "gemini-2.5-flash", originalReq, nil, rawJSON, nil)
+
+	if got := gjson.GetBytes(output, "output.0.action.sources.0.type").String(); got != "url" {
+		t.Fatalf("action.sources[0].type = %q, want %q: %s", got, "url", string(output))
+	}
+	if got := gjson.GetBytes(output, "output.0.action.sources.0.url").String(); got != "https://example.com/a" {
+		t.Fatalf("action.sources[0].url = %q, want %q: %s", got, "https://example.com/a", string(output))
+	}
+}
+
+func TestConvertGeminiResponseToOpenAIResponsesNonStream_GroundingByteOffsets(t *testing.T) {
+	originalReq := []byte(`{"model":"gpt-5","tools":[{"type":"web_search"}]}`)
+	text := "中文 grounded 引用测试"
+	segment := "grounded"
+	byteStart := bytes.Index([]byte(text), []byte(segment))
+	if byteStart < 0 {
+		t.Fatalf("segment %q not found in %q", segment, text)
+	}
+	byteEnd := byteStart + len([]byte(segment))
+	wantStart := utf8.RuneCountInString(text[:byteStart])
+	wantEnd := wantStart + utf8.RuneCountInString(segment)
+
+	rawJSON := []byte(fmt.Sprintf(`{
+		"responseId":"resp_byte_offsets",
+		"modelVersion":"gemini-2.5-flash",
+		"candidates":[{
+			"content":{"role":"model","parts":[{"text":%q}]},
+			"finishReason":"STOP",
+			"groundingMetadata":{
+				"groundingChunks":[
+					{"web":{"uri":"https://example.com/source","title":"Example Source"}}
+				],
+				"groundingSupports":[
+					{"segment":{"startIndex":%d,"endIndex":%d,"text":%q},"groundingChunkIndices":[0]}
+				]
+			}
+		}]
+	}`, text, byteStart, byteEnd, segment))
+
+	output := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "gemini-2.5-flash", originalReq, nil, rawJSON, nil)
+
+	if got := gjson.GetBytes(output, "output.1.content.0.annotations.0.start_index").Int(); got != int64(wantStart) {
+		t.Fatalf("start_index = %d, want %d: %s", got, wantStart, string(output))
+	}
+	if got := gjson.GetBytes(output, "output.1.content.0.annotations.0.end_index").Int(); got != int64(wantEnd) {
+		t.Fatalf("end_index = %d, want %d: %s", got, wantEnd, string(output))
+	}
+}
+
+func TestConvertGeminiResponseToOpenAIResponses_StreamGroundingCompletesWithAnnotationsAndSearchCall(t *testing.T) {
+	ctx := context.Background()
+	originalReq := []byte(`{
+		"model":"gpt-5",
+		"tools":[{"type":"web_search_preview"}]
+	}`)
+	requestJSON := ConvertOpenAIResponsesRequestToGemini("gemini-2.5-flash", originalReq, true)
+	var param any
+
+	firstChunk := []byte(`{
+		"responseId":"resp_stream_grounded",
+		"modelVersion":"gemini-2.5-flash",
+		"candidates":[{"content":{"role":"model","parts":[{"text":"Alpha beta"}]}}]
+	}`)
+	secondChunk := []byte(`{
+		"responseId":"resp_stream_grounded",
+		"modelVersion":"gemini-2.5-flash",
+		"candidates":[{
+			"finishReason":"STOP",
+			"groundingMetadata":{
+				"webSearchQueries":["Alpha beta source"],
+				"groundingChunks":[
+					{"web":{"uri":"https://example.com/a","title":"Example A"}}
+				],
+				"groundingSupports":[
+					{"segment":{"startIndex":0,"endIndex":10,"text":"Alpha beta"},"groundingChunkIndices":[0]}
+				]
+			}
+		}]
+	}`)
+
+	firstOutput := ConvertGeminiResponseToOpenAIResponses(ctx, "gemini-2.5-flash", originalReq, requestJSON, firstChunk, &param)
+	if len(firstOutput) == 0 {
+		t.Fatal("expected first chunk output")
+	}
+	var (
+		sawCreated       bool
+		sawInProgress    bool
+		sawSearchAdded   bool
+		sawSearchRunning bool
+		sawTextDelta     bool
+	)
+	for _, chunk := range firstOutput {
+		ev, data := parseSSEEvent(t, chunk)
+		switch ev {
+		case "response.created":
+			sawCreated = true
+		case "response.in_progress":
+			sawInProgress = true
+		case "response.output_item.added":
+			if data.Get("item.type").String() == "web_search_call" && data.Get("item.status").String() == "in_progress" {
+				sawSearchAdded = true
+			}
+		case "response.web_search_call.in_progress", "response.web_search_call.searching":
+			sawSearchRunning = true
+		case "response.output_text.delta":
+			sawTextDelta = true
+			if got := data.Get("delta").String(); got != "Alpha beta" {
+				t.Fatalf("delta = %q, want %q: %s", got, "Alpha beta", data.Raw)
+			}
+		}
+	}
+	if !sawCreated || !sawInProgress || !sawSearchAdded || !sawSearchRunning || !sawTextDelta {
+		t.Fatalf("missing first chunk events: created=%v inProgress=%v searchAdded=%v searchRunning=%v textDelta=%v", sawCreated, sawInProgress, sawSearchAdded, sawSearchRunning, sawTextDelta)
+	}
+
+	secondOutput := ConvertGeminiResponseToOpenAIResponses(ctx, "gemini-2.5-flash", originalReq, requestJSON, secondChunk, &param)
+	if len(secondOutput) == 0 {
+		t.Fatal("expected grounded completion events on finish chunk")
+	}
+	var (
+		sawAnnotationAdded bool
+		sawContentPartDone bool
+		sawMessageDone     bool
+		sawSearchCallDone  bool
+		sawSearchCompleted bool
+		sawCompleted       bool
+		posSearchCompleted = -1
+		posSearchDone      = -1
+		posAnnotationAdded = -1
+		posTextDone        = -1
+		posPartDone        = -1
+		posMessageDone     = -1
+	)
+	for i, chunk := range secondOutput {
+		ev, data := parseSSEEvent(t, chunk)
+		switch ev {
+		case "response.web_search_call.completed":
+			sawSearchCompleted = true
+			posSearchCompleted = i
+		case "response.output_text.annotation.added":
+			sawAnnotationAdded = true
+			if posAnnotationAdded == -1 {
+				posAnnotationAdded = i
+			}
+			if got := data.Get("annotation.type").String(); got != "url_citation" {
+				t.Fatalf("annotation.type = %q, want %q: %s", got, "url_citation", data.Raw)
+			}
+		case "response.output_text.done":
+			posTextDone = i
+		case "response.content_part.done":
+			sawContentPartDone = true
+			posPartDone = i
+			if got := data.Get("part.annotations.0.type").String(); got != "url_citation" {
+				t.Fatalf("part.annotations[0].type = %q, want %q: %s", got, "url_citation", data.Raw)
+			}
+		case "response.output_item.done":
+			switch data.Get("item.type").String() {
+			case "message":
+				sawMessageDone = true
+				posMessageDone = i
+				if got := data.Get("item.content.0.annotations.0.url").String(); got != "https://example.com/a" {
+					t.Fatalf("message annotation url = %q, want %q: %s", got, "https://example.com/a", data.Raw)
+				}
+			case "web_search_call":
+				sawSearchCallDone = true
+				posSearchDone = i
+				if got := data.Get("item.action.queries.0").String(); got != "Alpha beta source" {
+					t.Fatalf("search call action.queries[0] = %q, want %q: %s", got, "Alpha beta source", data.Raw)
+				}
+			}
+		case "response.completed":
+			sawCompleted = true
+			if got := data.Get("response.output.0.type").String(); got != "web_search_call" {
+				t.Fatalf("response.output[0].type = %q, want %q: %s", got, "web_search_call", data.Raw)
+			}
+			if got := data.Get("response.output.0.action.queries.0").String(); got != "Alpha beta source" {
+				t.Fatalf("response.output[0].action.queries[0] = %q, want %q: %s", got, "Alpha beta source", data.Raw)
+			}
+			if got := data.Get("response.output.1.type").String(); got != "message" {
+				t.Fatalf("response.output[1].type = %q, want %q: %s", got, "message", data.Raw)
+			}
+		}
+	}
+
+	if !sawSearchCompleted || !sawAnnotationAdded || !sawContentPartDone || !sawMessageDone || !sawSearchCallDone || !sawCompleted {
+		t.Fatalf("missing grounded completion events: searchCompleted=%v annotationAdded=%v contentPartDone=%v messageDone=%v searchCallDone=%v completed=%v", sawSearchCompleted, sawAnnotationAdded, sawContentPartDone, sawMessageDone, sawSearchCallDone, sawCompleted)
+	}
+	if !(posSearchCompleted >= 0 && posSearchDone >= 0 && posAnnotationAdded >= 0 && posTextDone >= 0 && posPartDone >= 0 && posMessageDone >= 0) {
+		t.Fatalf("missing event positions: searchCompleted=%d searchDone=%d annotationAdded=%d textDone=%d partDone=%d messageDone=%d", posSearchCompleted, posSearchDone, posAnnotationAdded, posTextDone, posPartDone, posMessageDone)
+	}
+	if !(posSearchCompleted < posSearchDone && posSearchDone < posAnnotationAdded && posAnnotationAdded < posTextDone && posTextDone < posPartDone && posPartDone < posMessageDone) {
+		t.Fatalf("unexpected grounded completion ordering: searchCompleted=%d searchDone=%d annotationAdded=%d textDone=%d partDone=%d messageDone=%d", posSearchCompleted, posSearchDone, posAnnotationAdded, posTextDone, posPartDone, posMessageDone)
 	}
 }

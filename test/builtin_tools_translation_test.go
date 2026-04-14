@@ -66,3 +66,23 @@ func TestOpenAIToGemini_TranslatesWebSearchOptionsToGoogleSearch(t *testing.T) {
 		t.Fatalf("did not expect search_context_size to be forwarded: %s", string(out))
 	}
 }
+
+func TestOpenAIResponsesToGemini_TranslatesWebSearchToGoogleSearch(t *testing.T) {
+	in := []byte(`{
+		"model":"gpt-5",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"latest headline"}]}],
+		"tools":[{"type":"web_search_preview_2025_03_11","search_context_size":"high"}]
+	}`)
+
+	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatGemini, "gemini-2.5-flash", in, false)
+
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("expected 1 tool, got %d: %s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "tools.0.googleSearch").Exists() {
+		t.Fatalf("expected tools[0].googleSearch to exist: %s", string(out))
+	}
+	if gjson.GetBytes(out, "tools.0.googleSearch.search_context_size").Exists() {
+		t.Fatalf("did not expect search_context_size to be forwarded: %s", string(out))
+	}
+}

@@ -23,6 +23,9 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	out := []byte(`{"contents":[]}`)
 
 	root := gjson.ParseBytes(rawJSON)
+	toolChoice := root.Get("tool_choice")
+	toolChoiceType := normalizedResponsesToolChoiceType(toolChoice)
+	forceWebSearch := isResponsesWebSearchChoiceType(toolChoiceType)
 
 	// Extract system instruction from OpenAI "instructions" field
 	if instructions := root.Get("instructions"); instructions.Exists() {
@@ -368,33 +371,57 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 		out, _ = sjson.SetRawBytes(out, "contents.-1", userContent)
 	}
 
-	// Convert tools to Gemini functionDeclarations format
+	// Convert tools to Gemini functionDeclarations/googleSearch format.
+	functionTools := []byte(`{"functionDeclarations":[]}`)
+	hasFunctionTools := false
+	hasGoogleSearch := false
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		geminiTools := []byte(`[{"functionDeclarations":[]}]`)
-
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			if tool.Get("type").String() == "function" {
-				funcDecl := []byte(`{"name":"","description":"","parametersJsonSchema":{}}`)
-
-				if name := tool.Get("name"); name.Exists() {
-					funcDecl, _ = sjson.SetBytes(funcDecl, "name", util.SanitizeFunctionName(name.String()))
+			if isResponsesWebSearchTool(tool) {
+				if toolChoiceType != "none" {
+					hasGoogleSearch = true
 				}
-				if desc := tool.Get("description"); desc.Exists() {
-					funcDecl, _ = sjson.SetBytes(funcDecl, "description", desc.String())
-				}
-				if params := tool.Get("parameters"); params.Exists() {
-					funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(params.Raw))
-				}
-
-				geminiTools, _ = sjson.SetRawBytes(geminiTools, "0.functionDeclarations.-1", funcDecl)
+				return true
 			}
+
+			if tool.Get("type").String() != "function" {
+				return true
+			}
+
+			funcDecl := []byte(`{"name":"","description":"","parametersJsonSchema":{"type":"object","properties":{}}}`)
+
+			if name := tool.Get("name"); name.Exists() {
+				funcDecl, _ = sjson.SetBytes(funcDecl, "name", util.SanitizeFunctionName(name.String()))
+			}
+			if desc := tool.Get("description"); desc.Exists() {
+				funcDecl, _ = sjson.SetBytes(funcDecl, "description", desc.String())
+			}
+			if params := tool.Get("parameters"); params.Exists() {
+				funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(params.Raw))
+			}
+
+			functionTools, _ = sjson.SetRawBytes(functionTools, "functionDeclarations.-1", funcDecl)
+			hasFunctionTools = true
 			return true
 		})
+	}
+	if forceWebSearch && toolChoiceType != "none" {
+		hasGoogleSearch = true
+	}
 
-		// Only add tools if there are function declarations
-		if funcDecls := gjson.GetBytes(geminiTools, "0.functionDeclarations"); funcDecls.Exists() && len(funcDecls.Array()) > 0 {
-			out, _ = sjson.SetRawBytes(out, "tools", geminiTools)
+	if hasFunctionTools || hasGoogleSearch {
+		geminiTools := []byte(`[]`)
+		if hasFunctionTools {
+			geminiTools, _ = sjson.SetRawBytes(geminiTools, "-1", functionTools)
 		}
+		if hasGoogleSearch {
+			geminiTools, _ = sjson.SetRawBytes(geminiTools, "-1", []byte(`{"googleSearch":{}}`))
+		}
+		out, _ = sjson.SetRawBytes(out, "tools", geminiTools)
+	}
+
+	if toolChoiceType == "none" || (forceWebSearch && hasFunctionTools) {
+		out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
 	}
 
 	// Handle generation config from OpenAI format
@@ -453,4 +480,37 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	result := out
 	result = common.AttachDefaultSafetySettings(result, "safetySettings")
 	return result
+}
+
+func isResponsesWebSearchTool(tool gjson.Result) bool {
+	return isResponsesWebSearchChoiceType(normalizeResponsesBuiltinToolType(tool.Get("type").String()))
+}
+
+func normalizedResponsesToolChoiceType(toolChoice gjson.Result) string {
+	if !toolChoice.Exists() {
+		return ""
+	}
+	if toolChoice.IsObject() {
+		return normalizeResponsesBuiltinToolType(toolChoice.Get("type").String())
+	}
+	if toolChoice.Type == gjson.String {
+		return normalizeResponsesBuiltinToolType(toolChoice.String())
+	}
+	return ""
+}
+
+func normalizeResponsesBuiltinToolType(toolType string) string {
+	toolType = strings.TrimSpace(toolType)
+	switch {
+	case toolType == "":
+		return ""
+	case strings.HasPrefix(toolType, "web_search_preview"):
+		return "web_search"
+	default:
+		return toolType
+	}
+}
+
+func isResponsesWebSearchChoiceType(toolType string) bool {
+	return strings.HasPrefix(toolType, "web_search")
 }
