@@ -137,6 +137,61 @@ func TestConvertClaudeRequestToGemini_WebSearchToolMappedToGoogleSearch(t *testi
 	}
 }
 
+func TestConvertClaudeRequestToGemini_CodeExecutionToolMappedToGeminiCodeExecution(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-flash-preview",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "Calculate fibonacci(20)."}
+				]
+			}
+		],
+		"tools": [
+			{
+				"type": "code_execution_20250825",
+				"name": "code_execution"
+			},
+			{
+				"name": "json",
+				"description": "A JSON tool",
+				"input_schema": {
+					"type": "object",
+					"properties": {}
+				}
+			}
+		],
+		"tool_choice": {"type": "auto"}
+	}`)
+
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	tools := gjson.GetBytes(output, "tools").Array()
+	if len(tools) != 2 {
+		t.Fatalf("Expected 2 Gemini tools, got %d: %s", len(tools), string(output))
+	}
+
+	foundCodeExecution := false
+	foundFunctionDecl := false
+	for _, tool := range tools {
+		if tool.Get("codeExecution").Exists() {
+			foundCodeExecution = true
+		}
+		if tool.Get("functionDeclarations.0.name").String() == "json" {
+			foundFunctionDecl = true
+		}
+	}
+	if !foundCodeExecution {
+		t.Fatalf("Expected codeExecution tool in output: %s", string(output))
+	}
+	if !foundFunctionDecl {
+		t.Fatalf("Expected function declaration for custom tool in output: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "AUTO" {
+		t.Fatalf("Expected function calling mode AUTO, got %q: %s", got, string(output))
+	}
+}
+
 func TestConvertClaudeRequestToGemini_ToolChoiceSpecificFunctionOmitsGoogleSearch(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3-flash-preview",
@@ -172,6 +227,51 @@ func TestConvertClaudeRequestToGemini_ToolChoiceSpecificFunctionOmitsGoogleSearc
 	}
 	if gjson.GetBytes(output, "tools.0.googleSearch").Exists() {
 		t.Fatalf("Did not expect googleSearch tool when a custom function is forced: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
+		t.Fatalf("Expected function calling mode ANY, got %q: %s", got, string(output))
+	}
+	allowed := gjson.GetBytes(output, "toolConfig.functionCallingConfig.allowedFunctionNames").Array()
+	if len(allowed) != 1 || allowed[0].String() != "json" {
+		t.Fatalf("Expected allowedFunctionNames ['json'], got %s", gjson.GetBytes(output, "toolConfig.functionCallingConfig.allowedFunctionNames").Raw)
+	}
+}
+
+func TestConvertClaudeRequestToGemini_ToolChoiceSpecificFunctionOmitsCodeExecution(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-flash-preview",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "hi"}
+				]
+			}
+		],
+		"tools": [
+			{
+				"type": "code_execution_20250825",
+				"name": "code_execution"
+			},
+			{
+				"name": "json",
+				"description": "A JSON tool",
+				"input_schema": {
+					"type": "object",
+					"properties": {}
+				}
+			}
+		],
+		"tool_choice": {"type": "tool", "name": "json"}
+	}`)
+
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	tools := gjson.GetBytes(output, "tools").Array()
+	if len(tools) != 1 {
+		t.Fatalf("Expected only function declarations tool, got %d: %s", len(tools), string(output))
+	}
+	if gjson.GetBytes(output, "tools.0.codeExecution").Exists() {
+		t.Fatalf("Did not expect codeExecution tool when a custom function is forced: %s", string(output))
 	}
 	if got := gjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
 		t.Fatalf("Expected function calling mode ANY, got %q: %s", got, string(output))
@@ -239,6 +339,63 @@ func TestConvertClaudeRequestToGemini_ToolChoiceSpecificWebSearchDisablesFunctio
 	}
 }
 
+func TestConvertClaudeRequestToGemini_ToolChoiceSpecificCodeExecutionDisablesFunctionCalling(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-flash-preview",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "calculate this"}
+				]
+			}
+		],
+		"tools": [
+			{
+				"type": "code_execution_20250825",
+				"name": "code_execution"
+			},
+			{
+				"name": "json",
+				"description": "A JSON tool",
+				"input_schema": {
+					"type": "object",
+					"properties": {}
+				}
+			}
+		],
+		"tool_choice": {"type": "tool", "name": "code_execution"}
+	}`)
+
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	tools := gjson.GetBytes(output, "tools").Array()
+	if len(tools) != 2 {
+		t.Fatalf("Expected codeExecution plus function declarations, got %d: %s", len(tools), string(output))
+	}
+	foundCodeExecution := false
+	foundFunctionDecl := false
+	for _, tool := range tools {
+		if tool.Get("codeExecution").Exists() {
+			foundCodeExecution = true
+		}
+		if tool.Get("functionDeclarations.0.name").String() == "json" {
+			foundFunctionDecl = true
+		}
+	}
+	if !foundCodeExecution {
+		t.Fatalf("Expected codeExecution tool when code_execution is forced: %s", string(output))
+	}
+	if !foundFunctionDecl {
+		t.Fatalf("Expected function declarations to remain when code_execution is forced: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "NONE" {
+		t.Fatalf("Expected function calling mode NONE when code_execution is forced, got %q: %s", got, string(output))
+	}
+	if gjson.GetBytes(output, "toolConfig.functionCallingConfig.allowedFunctionNames").Exists() {
+		t.Fatalf("Did not expect allowedFunctionNames when code_execution is forced: %s", string(output))
+	}
+}
+
 func TestConvertClaudeRequestToGemini_ToolChoiceNoneOmitsGoogleSearch(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3-flash-preview",
@@ -274,6 +431,47 @@ func TestConvertClaudeRequestToGemini_ToolChoiceNoneOmitsGoogleSearch(t *testing
 	}
 	if gjson.GetBytes(output, "tools.0.googleSearch").Exists() {
 		t.Fatalf("Did not expect googleSearch tool when tool_choice is none: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "NONE" {
+		t.Fatalf("Expected function calling mode NONE, got %q: %s", got, string(output))
+	}
+}
+
+func TestConvertClaudeRequestToGemini_ToolChoiceNoneOmitsCodeExecution(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-flash-preview",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "hi"}
+				]
+			}
+		],
+		"tools": [
+			{
+				"type": "code_execution_20250825",
+				"name": "code_execution"
+			},
+			{
+				"name": "json",
+				"description": "A JSON tool",
+				"input_schema": {
+					"type": "object",
+					"properties": {}
+				}
+			}
+		],
+		"tool_choice": {"type": "none"}
+	}`)
+
+	output := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	tools := gjson.GetBytes(output, "tools").Array()
+	if len(tools) != 1 {
+		t.Fatalf("Expected only function declarations tool, got %d: %s", len(tools), string(output))
+	}
+	if gjson.GetBytes(output, "tools.0.codeExecution").Exists() {
+		t.Fatalf("Did not expect codeExecution tool when tool_choice is none: %s", string(output))
 	}
 	if got := gjson.GetBytes(output, "toolConfig.functionCallingConfig.mode").String(); got != "NONE" {
 		t.Fatalf("Expected function calling mode NONE, got %q: %s", got, string(output))

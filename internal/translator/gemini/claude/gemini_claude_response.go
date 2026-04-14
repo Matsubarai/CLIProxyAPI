@@ -31,6 +31,10 @@ type Params struct {
 	ToolNameMap      map[string]string
 	SanitizedNameMap map[string]string
 	SawToolCall      bool
+	// Gemini emits code execution as separate executableCode/codeExecutionResult parts, so the
+	// stream translator keeps the last synthetic server tool ID to pair the result correctly.
+	LastServerToolUseID   string
+	CodeExecutionRequests int64
 
 	// Search responses need the full Gemini stream so grounded metadata can be converted into
 	// Claude citations and synthetic web_search blocks once the stream is complete.
@@ -43,6 +47,8 @@ type aggregatedGeminiPart struct {
 	Thought bool
 	Name    string
 	Args    strings.Builder
+	// Raw preserves opaque Gemini native-tool parts that should not be merged like text/function args.
+	Raw string
 }
 
 type groundedSupport struct {
@@ -77,42 +83,52 @@ var serverToolUseIDCounter uint64
 func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &Params{
-			IsGlAPIKey:           false,
-			HasFirstResponse:     false,
-			ResponseType:         0,
-			ResponseIndex:        0,
-			ToolNameMap:          util.ToolNameMapFromClaudeRequest(originalRequestRawJSON),
-			SanitizedNameMap:     util.SanitizedToolNameMap(originalRequestRawJSON),
-			SawToolCall:          false,
-			BufferedGeminiChunks: nil,
+			IsGlAPIKey:            false,
+			HasFirstResponse:      false,
+			ResponseType:          0,
+			ResponseIndex:         0,
+			ToolNameMap:           util.ToolNameMapFromClaudeRequest(originalRequestRawJSON),
+			SanitizedNameMap:      util.SanitizedToolNameMap(originalRequestRawJSON),
+			SawToolCall:           false,
+			LastServerToolUseID:   "",
+			CodeExecutionRequests: 0,
+			BufferedGeminiChunks:  nil,
 		}
 	}
 
-	searchEnabled := searchEnabledForGeminiResponse(originalRequestRawJSON, requestRawJSON)
-	if searchEnabled && !bytes.Equal(rawJSON, []byte("[DONE]")) {
-		(*param).(*Params).BufferedGeminiChunks = append((*param).(*Params).BufferedGeminiChunks, append([]byte(nil), rawJSON...))
-	}
-	if bytes.Equal(rawJSON, []byte("[DONE]")) {
-		// If the completed stream resolves to a grounded search answer, replace the normal
-		// message_stop path with a Claude-style grounded finale.
-		if outputs := finalizeGroundedSearchStreamOnDone(originalRequestRawJSON, (*param).(*Params)); len(outputs) > 0 {
-			return outputs
+	if shouldBufferEntireGeminiResponse(originalRequestRawJSON, requestRawJSON) {
+		if !bytes.Equal(rawJSON, []byte("[DONE]")) {
+			(*param).(*Params).BufferedGeminiChunks = append((*param).(*Params).BufferedGeminiChunks, append([]byte(nil), rawJSON...))
+			return nil
 		}
+
+		// Grounded search metadata typically arrives only on the terminal Gemini chunk. Buffering
+		// lets the final Claude SSE follow the official web_search ordering instead of patching it
+		// in after text has already been streamed.
+		finalResponse := aggregateGeminiBufferedChunks((*param).(*Params).BufferedGeminiChunks)
+		(*param).(*Params).BufferedGeminiChunks = nil
+		if len(finalResponse) == 0 {
+			return nil
+		}
+
+		message := buildClaudeMessageFromGeminiResponse(originalRequestRawJSON, finalResponse)
+		return [][]byte{renderClaudeMessageAsSSE(message)}
 	}
+
 	if chunkItems := geminiChunkItems(rawJSON); len(chunkItems) > 1 {
 		outputs := make([][]byte, 0, len(chunkItems))
 		for _, item := range chunkItems {
-			outputs = append(outputs, convertGeminiResponseToClaudeImmediate([]byte(item.Raw), param, searchEnabled)...)
+			outputs = append(outputs, convertGeminiResponseToClaudeImmediate([]byte(item.Raw), param)...)
 		}
 		return outputs
 	}
 	if chunkItems := geminiChunkItems(rawJSON); len(chunkItems) == 1 && bytes.TrimSpace(rawJSON)[0] == '[' {
-		return convertGeminiResponseToClaudeImmediate([]byte(chunkItems[0].Raw), param, searchEnabled)
+		return convertGeminiResponseToClaudeImmediate([]byte(chunkItems[0].Raw), param)
 	}
-	return convertGeminiResponseToClaudeImmediate(rawJSON, param, searchEnabled)
+	return convertGeminiResponseToClaudeImmediate(rawJSON, param)
 }
 
-func convertGeminiResponseToClaudeImmediate(rawJSON []byte, param *any, searchEnabled bool) [][]byte {
+func convertGeminiResponseToClaudeImmediate(rawJSON []byte, param *any) [][]byte {
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
 		// Only send message_stop if we have actually output content
 		if (*param).(*Params).HasContent {
@@ -156,9 +172,11 @@ func convertGeminiResponseToClaudeImmediate(rawJSON []byte, param *any, searchEn
 			// Extract the different types of content from each part
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
+			executableCodeResult := geminiExecutableCodePart(partResult)
+			codeExecutionResult := geminiCodeExecutionResultPart(partResult)
 
 			// Handle text content (both regular content and thinking)
-			if partTextResult.Exists() {
+			if partTextResult.Exists() && partTextResult.String() != "" {
 				// Process thinking content (internal reasoning)
 				if partResult.Get("thought").Bool() {
 					// Continue existing thinking block
@@ -268,22 +286,76 @@ func convertGeminiResponseToClaudeImmediate(rawJSON []byte, param *any, searchEn
 				}
 				(*param).(*Params).ResponseType = 3
 				(*param).(*Params).HasContent = true
+			} else if executableCodeResult.Exists() {
+				if (*param).(*Params).ResponseType == 2 {
+					// output = output + "event: content_block_delta\n"
+					// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, (*param).(*Params).ResponseIndex)
+					// output = output + "\n\n\n"
+				}
+
+				if (*param).(*Params).ResponseType != 0 {
+					appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+					(*param).(*Params).ResponseIndex++
+					(*param).(*Params).ResponseType = 0
+				}
+
+				serverToolUseID := util.SanitizeClaudeToolID(fmt.Sprintf("srvtoolu_%d", atomic.AddUint64(&serverToolUseIDCounter, 1)))
+				(*param).(*Params).LastServerToolUseID = serverToolUseID
+
+				start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"server_tool_use","id":"","name":""}}`, (*param).(*Params).ResponseIndex))
+				start, _ = sjson.SetBytes(start, "content_block.id", serverToolUseID)
+				start, _ = sjson.SetBytes(start, "content_block.name", "code_execution")
+				appendEvent("content_block_start", string(start))
+
+				input := buildClaudeCodeExecutionInput(executableCodeResult)
+				delta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, (*param).(*Params).ResponseIndex))
+				delta, _ = sjson.SetBytes(delta, "delta.partial_json", string(input))
+				appendEvent("content_block_delta", string(delta))
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+
+				(*param).(*Params).ResponseIndex++
+				(*param).(*Params).HasContent = true
+			} else if codeExecutionResult.Exists() {
+				if (*param).(*Params).ResponseType == 2 {
+					// output = output + "event: content_block_delta\n"
+					// output = output + fmt.Sprintf(`data: {"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":null}}`, (*param).(*Params).ResponseIndex)
+					// output = output + "\n\n\n"
+				}
+
+				if (*param).(*Params).ResponseType != 0 {
+					appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+					(*param).(*Params).ResponseIndex++
+					(*param).(*Params).ResponseType = 0
+				}
+
+				serverToolUseID := (*param).(*Params).LastServerToolUseID
+				if serverToolUseID == "" {
+					serverToolUseID = util.SanitizeClaudeToolID(fmt.Sprintf("srvtoolu_%d", atomic.AddUint64(&serverToolUseIDCounter, 1)))
+					(*param).(*Params).LastServerToolUseID = serverToolUseID
+				}
+
+				result := buildClaudeCodeExecutionResultContent(codeExecutionResult)
+				start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"code_execution_tool_result","tool_use_id":"","content":{}}}`, (*param).(*Params).ResponseIndex))
+				start, _ = sjson.SetBytes(start, "content_block.tool_use_id", serverToolUseID)
+				start, _ = sjson.SetRawBytes(start, "content_block.content", result)
+				appendEvent("content_block_start", string(start))
+				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+
+				(*param).(*Params).ResponseIndex++
+				(*param).(*Params).CodeExecutionRequests++
+				(*param).(*Params).HasContent = true
 			}
 		}
 	}
 
 	usageResult := gjson.GetBytes(rawJSON, "usageMetadata")
 	if usageResult.Exists() && bytes.Contains(rawJSON, []byte(`"finishReason"`)) {
-		if searchEnabled && hasGeminiGroundingMetadata(rawJSON) {
-			if len(output) == 0 {
-				return nil
-			}
-			return [][]byte{output}
-		}
 		if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
 			// Only send final events if we have actually output content
 			if (*param).(*Params).HasContent {
-				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+				if (*param).(*Params).ResponseType != 0 {
+					appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+				}
 
 				template := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 				if (*param).(*Params).SawToolCall {
@@ -295,6 +367,9 @@ func convertGeminiResponseToClaudeImmediate(rawJSON []byte, param *any, searchEn
 				thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
 				template, _ = sjson.SetBytes(template, "usage.output_tokens", candidatesTokenCountResult.Int()+thoughtsTokenCount)
 				template, _ = sjson.SetBytes(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
+				if (*param).(*Params).CodeExecutionRequests > 0 {
+					template, _ = sjson.SetBytes(template, "usage.server_tool_use.code_execution_requests", (*param).(*Params).CodeExecutionRequests)
+				}
 
 				appendEvent("message_delta", string(template))
 			}
@@ -338,24 +413,15 @@ func buildClaudeMessageFromGeminiResponse(originalRequestRawJSON, rawJSON []byte
 
 	parts := root.Get("candidates.0.content.parts")
 	groundingMetadata := root.Get("candidates.0.groundingMetadata")
-	hasToolCall := false
-
-	if groundingMetadata.Exists() && !hasGeminiFunctionCall(parts) {
-		// Gemini grounding metadata is translated into Claude's built-in web search response
-		// shape: cited text, synthetic server_tool_use, and web_search_tool_result.
-		contentBlocks := buildClaudeGroundedContent(parts, groundingMetadata)
-		for _, block := range contentBlocks {
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
-		}
-		if count := groundedWebSearchRequestCount(groundingMetadata); count > 0 {
-			out, _ = sjson.SetBytes(out, "usage.server_tool_use.web_search_requests", count)
-		}
-	} else {
-		contentBlocks, sawToolCall := buildClaudeContentFromGeminiParts(parts, toolNameMap, sanitizedNameMap)
-		hasToolCall = sawToolCall
-		for _, block := range contentBlocks {
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
-		}
+	contentBlocks, hasToolCall, codeExecutionRequests := buildClaudeContentFromGeminiParts(parts, groundingMetadata, toolNameMap, sanitizedNameMap)
+	for _, block := range contentBlocks {
+		out, _ = sjson.SetRawBytes(out, "content.-1", block)
+	}
+	if count := groundedWebSearchRequestCount(groundingMetadata); count > 0 {
+		out, _ = sjson.SetBytes(out, "usage.server_tool_use.web_search_requests", count)
+	}
+	if codeExecutionRequests > 0 {
+		out, _ = sjson.SetBytes(out, "usage.server_tool_use.code_execution_requests", codeExecutionRequests)
 	}
 
 	stopReason := "end_turn"
@@ -382,20 +448,26 @@ func buildClaudeMessageFromGeminiResponse(originalRequestRawJSON, rawJSON []byte
 	return out
 }
 
-func buildClaudeContentFromGeminiParts(parts gjson.Result, toolNameMap, sanitizedNameMap map[string]string) ([][]byte, bool) {
+func buildClaudeContentFromGeminiParts(parts, groundingMetadata gjson.Result, toolNameMap, sanitizedNameMap map[string]string) ([][]byte, bool, int64) {
 	contentBlocks := make([][]byte, 0)
 	textBuilder := strings.Builder{}
 	thinkingBuilder := strings.Builder{}
 	toolIDCounter := 0
 	hasToolCall := false
+	codeExecutionRequests := int64(0)
+	lastServerToolUseID := ""
+	visibleText := concatenateVisibleGeminiText(parts)
+	supports := resolvedGroundedSupports(visibleText, groundedSupportsFromMetadata(groundingMetadata))
+	supportIdx := 0
+	visibleOffset := 0
 
 	flushText := func() {
 		if textBuilder.Len() == 0 {
 			return
 		}
-		block := []byte(`{"type":"text","text":""}`)
-		block, _ = sjson.SetBytes(block, "text", textBuilder.String())
-		contentBlocks = append(contentBlocks, block)
+		for _, block := range buildClaudeTextBlocksWithGrounding(textBuilder.String(), supports, &supportIdx, &visibleOffset) {
+			contentBlocks = append(contentBlocks, block)
+		}
 		textBuilder.Reset()
 	}
 
@@ -442,41 +514,125 @@ func buildClaudeContentFromGeminiParts(parts gjson.Result, toolNameMap, sanitize
 				contentBlocks = append(contentBlocks, toolBlock)
 				continue
 			}
+
+			if executableCode := geminiExecutableCodePart(part); executableCode.Exists() {
+				flushThinking()
+				flushText()
+
+				lastServerToolUseID = util.SanitizeClaudeToolID(fmt.Sprintf("srvtoolu_%d", atomic.AddUint64(&serverToolUseIDCounter, 1)))
+				serverToolUse := []byte(`{"type":"server_tool_use","id":"","name":"code_execution","input":{}}`)
+				serverToolUse, _ = sjson.SetBytes(serverToolUse, "id", lastServerToolUseID)
+				serverToolUse, _ = sjson.SetRawBytes(serverToolUse, "input", buildClaudeCodeExecutionInput(executableCode))
+				contentBlocks = append(contentBlocks, serverToolUse)
+				continue
+			}
+
+			if codeExecutionResult := geminiCodeExecutionResultPart(part); codeExecutionResult.Exists() {
+				flushThinking()
+				flushText()
+
+				if lastServerToolUseID == "" {
+					lastServerToolUseID = util.SanitizeClaudeToolID(fmt.Sprintf("srvtoolu_%d", atomic.AddUint64(&serverToolUseIDCounter, 1)))
+				}
+				toolResult := []byte(`{"type":"code_execution_tool_result","tool_use_id":"","content":{}}`)
+				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", lastServerToolUseID)
+				toolResult, _ = sjson.SetRawBytes(toolResult, "content", buildClaudeCodeExecutionResultContent(codeExecutionResult))
+				contentBlocks = append(contentBlocks, toolResult)
+				codeExecutionRequests++
+				continue
+			}
 		}
 	}
 
 	flushThinking()
 	flushText()
 
-	return contentBlocks, hasToolCall
+	if groundingMetadata.Exists() {
+		// Keep synthetic web_search blocks after the grounded text in the logical Claude message.
+		// The streaming renderer can then reorder them into Claude's wire-level event sequence.
+		toolUseID := util.SanitizeClaudeToolID(fmt.Sprintf("srvtoolu_%d", atomic.AddUint64(&serverToolUseIDCounter, 1)))
+		serverToolUse := []byte(`{"type":"server_tool_use","id":"","name":"web_search","input":{}}`)
+		serverToolUse, _ = sjson.SetBytes(serverToolUse, "id", toolUseID)
+		if query := firstGroundedQuery(groundingMetadata); query != "" {
+			serverToolUse, _ = sjson.SetBytes(serverToolUse, "input.query", query)
+		}
+		contentBlocks = append(contentBlocks, serverToolUse)
+
+		searchResults := buildClaudeWebSearchResults(groundingMetadata)
+		toolResult := []byte(`{"type":"web_search_tool_result","tool_use_id":"","content":[]}`)
+		toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", toolUseID)
+		for _, result := range searchResults {
+			toolResult, _ = sjson.SetRawBytes(toolResult, "content.-1", result)
+		}
+		contentBlocks = append(contentBlocks, toolResult)
+	}
+
+	return contentBlocks, hasToolCall, codeExecutionRequests
 }
 
-func buildClaudeGroundedContent(parts, groundingMetadata gjson.Result) [][]byte {
-	contentBlocks := make([][]byte, 0)
-	contentBlocks = append(contentBlocks, buildClaudeThinkingBlocks(parts)...)
-
-	visibleText := concatenateVisibleGeminiText(parts)
-	for _, block := range buildClaudeGroundedTextBlocks(visibleText, groundingMetadata) {
-		contentBlocks = append(contentBlocks, block)
+func buildClaudeTextBlocksWithGrounding(text string, supports []groundedSupport, supportIdx, visibleOffset *int) [][]byte {
+	if text == "" {
+		return nil
 	}
 
-	toolUseID := util.SanitizeClaudeToolID(fmt.Sprintf("srvtoolu_%d", atomic.AddUint64(&serverToolUseIDCounter, 1)))
-	serverToolUse := []byte(`{"type":"server_tool_use","id":"","name":"web_search","input":{}}`)
-	serverToolUse, _ = sjson.SetBytes(serverToolUse, "id", toolUseID)
-	if query := firstGroundedQuery(groundingMetadata); query != "" {
-		serverToolUse, _ = sjson.SetBytes(serverToolUse, "input.query", query)
+	runes := []rune(text)
+	partStart := *visibleOffset
+	partEnd := partStart + len(runes)
+	blocks := make([][]byte, 0)
+	appendPlain := func(s string) {
+		if s == "" {
+			return
+		}
+		block := []byte(`{"type":"text","text":""}`)
+		block, _ = sjson.SetBytes(block, "text", s)
+		blocks = append(blocks, block)
 	}
-	contentBlocks = append(contentBlocks, serverToolUse)
 
-	searchResults := buildClaudeWebSearchResults(groundingMetadata)
-	toolResult := []byte(`{"type":"web_search_tool_result","tool_use_id":"","content":[]}`)
-	toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", toolUseID)
-	for _, result := range searchResults {
-		toolResult, _ = sjson.SetRawBytes(toolResult, "content.-1", result)
+	for *supportIdx < len(supports) && supports[*supportIdx].End <= partStart {
+		(*supportIdx)++
 	}
-	contentBlocks = append(contentBlocks, toolResult)
 
-	return contentBlocks
+	if len(supports) == 0 || *supportIdx >= len(supports) || supports[*supportIdx].Start >= partEnd {
+		appendPlain(text)
+		*visibleOffset = partEnd
+		return blocks
+	}
+
+	cursor := 0
+	scanIdx := *supportIdx
+	for scanIdx < len(supports) && supports[scanIdx].Start < partEnd {
+		support := supports[scanIdx]
+		localStart := maxInt(support.Start, partStart) - partStart
+		localEnd := minInt(support.End, partEnd) - partStart
+		if localStart > cursor {
+			appendPlain(string(runes[cursor:localStart]))
+		}
+		if localEnd > localStart {
+			block := []byte(`{"type":"text","text":"","citations":[]}`)
+			block, _ = sjson.SetBytes(block, "text", string(runes[localStart:localEnd]))
+			if len(support.Citations) == 0 {
+				block, _ = sjson.DeleteBytes(block, "citations")
+			} else {
+				for _, citation := range support.Citations {
+					block, _ = sjson.SetRawBytes(block, "citations.-1", citation)
+				}
+			}
+			blocks = append(blocks, block)
+		}
+		cursor = maxInt(cursor, localEnd)
+		if support.End <= partEnd {
+			*supportIdx = scanIdx + 1
+		} else {
+			*supportIdx = scanIdx
+		}
+		scanIdx++
+	}
+
+	if cursor < len(runes) {
+		appendPlain(string(runes[cursor:]))
+	}
+	*visibleOffset = partEnd
+	return blocks
 }
 
 func buildClaudeThinkingBlocks(parts gjson.Result) [][]byte {
@@ -554,62 +710,6 @@ func buildClaudeWebSearchResults(groundingMetadata gjson.Result) [][]byte {
 	}
 
 	return results
-}
-
-func buildClaudeGroundedTextBlocks(text string, groundingMetadata gjson.Result) [][]byte {
-	if text == "" {
-		return nil
-	}
-
-	supports := resolvedGroundedSupports(text, groundedSupportsFromMetadata(groundingMetadata))
-	if len(supports) == 0 {
-		block := []byte(`{"type":"text","text":""}`)
-		block, _ = sjson.SetBytes(block, "text", text)
-		return [][]byte{block}
-	}
-
-	blocks := make([][]byte, 0, len(supports)+1)
-	cursor := 0
-	runes := []rune(text)
-	textLen := len(runes)
-	for _, support := range supports {
-		if support.Start > cursor {
-			block := []byte(`{"type":"text","text":""}`)
-			block, _ = sjson.SetBytes(block, "text", string(runes[cursor:support.Start]))
-			blocks = append(blocks, block)
-		}
-
-		if support.End <= support.Start || support.Start >= textLen {
-			cursor = maxInt(cursor, support.End)
-			continue
-		}
-
-		end := minInt(support.End, textLen)
-		citedText := string(runes[support.Start:end])
-		if len(support.Citations) == 0 {
-			block := []byte(`{"type":"text","text":""}`)
-			block, _ = sjson.SetBytes(block, "text", citedText)
-			blocks = append(blocks, block)
-			cursor = end
-			continue
-		}
-
-		block := []byte(`{"type":"text","text":"","citations":[]}`)
-		block, _ = sjson.SetBytes(block, "text", citedText)
-		for _, citation := range support.Citations {
-			block, _ = sjson.SetRawBytes(block, "citations.-1", citation)
-		}
-		blocks = append(blocks, block)
-		cursor = end
-	}
-
-	if cursor < textLen {
-		block := []byte(`{"type":"text","text":""}`)
-		block, _ = sjson.SetBytes(block, "text", string(runes[cursor:]))
-		blocks = append(blocks, block)
-	}
-
-	return blocks
 }
 
 func resolvedGroundedSupports(text string, supports []groundedSupport) []groundedSupport {
@@ -837,110 +937,129 @@ func ensureClaudeWebSearchResultEncryptedContent(result []byte) []byte {
 	return result
 }
 
-func finalizeGroundedSearchStreamOnDone(originalRequestRawJSON []byte, param *Params) [][]byte {
-	if len(param.BufferedGeminiChunks) == 0 {
-		return nil
+func renderClaudeMessageAsSSE(message []byte) []byte {
+	if output := renderClaudeGroundedWebSearchMessageAsSSE(message); len(output) > 0 {
+		return output
 	}
-	// Reconstruct a single Gemini response from the streamed chunks so non-stream grounding
-	// translation can be reused for the final Claude search-shaped payload.
-	finalResponse := aggregateGeminiBufferedChunks(param.BufferedGeminiChunks)
-	param.BufferedGeminiChunks = nil
-	if len(finalResponse) == 0 {
-		return nil
-	}
-	parts := gjson.GetBytes(finalResponse, "candidates.0.content.parts")
-	if hasGeminiFunctionCall(parts) || !gjson.GetBytes(finalResponse, "candidates.0.groundingMetadata").Exists() {
-		return nil
-	}
-	message := buildClaudeMessageFromGeminiResponse(originalRequestRawJSON, finalResponse)
-	return [][]byte{renderClaudeGroundedSearchFinaleAsSSE(message, param.ResponseType, param.ResponseIndex)}
+	return renderClaudeMessageAsSSEGeneric(message)
 }
 
-func hasGeminiFunctionCall(parts gjson.Result) bool {
-	if !parts.IsArray() {
-		return false
-	}
-	for _, part := range parts.Array() {
-		if part.Get("functionCall").Exists() {
-			return true
+func renderClaudeGroundedWebSearchMessageAsSSE(message []byte) []byte {
+	blocks := collectClaudeRenderableBlocks(message)
+	searchToolUsePos := -1
+	searchToolResultPos := -1
+	firstDeferredTextPos := -1
+
+	for i, block := range blocks {
+		blockType := block.Get("type").String()
+		if searchToolUsePos < 0 && blockType == "server_tool_use" && block.Get("name").String() == "web_search" {
+			searchToolUsePos = i
+			break
 		}
 	}
-	return false
-}
-
-func hasGeminiGroundingMetadata(rawJSON []byte) bool {
-	for _, item := range geminiChunkItems(rawJSON) {
-		if item.Get("candidates.0.groundingMetadata").Exists() {
-			return true
+	if searchToolUsePos <= 0 {
+		return nil
+	}
+	for i := searchToolUsePos + 1; i < len(blocks); i++ {
+		if blocks[i].Get("type").String() == "web_search_tool_result" {
+			searchToolResultPos = i
+			break
 		}
 	}
-	return false
-}
+	if searchToolResultPos < 0 {
+		return nil
+	}
+	for i := 0; i < searchToolUsePos; i++ {
+		if blocks[i].Get("type").String() == "text" {
+			firstDeferredTextPos = i
+			break
+		}
+	}
+	if firstDeferredTextPos < 0 {
+		return nil
+	}
+	for i := firstDeferredTextPos; i < searchToolUsePos; i++ {
+		if blocks[i].Get("type").String() != "text" {
+			return nil
+		}
+	}
 
-func renderClaudeGroundedSearchFinaleAsSSE(message []byte, responseType, responseIndex int) []byte {
+	// Claude's documented wire format opens the answer text block first, then emits the
+	// web_search tool use/result, and only then streams the grounded text/citations.
 	output := make([]byte, 0, len(message)+512)
-	textIndex := -1
-	nextIndex := responseIndex
-	if responseType != 0 {
-		nextIndex = responseIndex + 1
-	}
-	if responseType == 1 {
-		textIndex = responseIndex
+	output = appendClaudeMessageStartAsSSE(output, message)
+
+	nextIndex := 0
+	for i := 0; i < firstDeferredTextPos; i++ {
+		output = appendClaudeRenderableBlockAsSSE(output, nextIndex, blocks[i])
+		nextIndex++
 	}
 
-	emitStop := func(index int) {
-		stop := []byte(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, index))
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", stop, 3)
+	deferredTextIndex := nextIndex
+	output = appendClaudeTextBlockStartAsSSE(output, deferredTextIndex)
+	nextIndex++
+
+	for i := searchToolUsePos; i <= searchToolResultPos; i++ {
+		output = appendClaudeRenderableBlockAsSSE(output, nextIndex, blocks[i])
+		nextIndex++
 	}
 
-	if len(message) > 0 {
-		content := gjson.GetBytes(message, "content")
-		hasTextBlock := false
-		for _, block := range content.Array() {
-			if block.Get("type").String() != "text" {
+	output = appendClaudeTextBlockDeltaAndStopAsSSE(output, deferredTextIndex, blocks[firstDeferredTextPos])
+
+	for i := firstDeferredTextPos + 1; i < searchToolUsePos; i++ {
+		output = appendClaudeRenderableBlockAsSSE(output, nextIndex, blocks[i])
+		nextIndex++
+	}
+	for i := searchToolResultPos + 1; i < len(blocks); i++ {
+		output = appendClaudeRenderableBlockAsSSE(output, nextIndex, blocks[i])
+		nextIndex++
+	}
+
+	output = appendClaudeMessageEndAsSSE(output, message)
+	return output
+}
+
+func renderClaudeMessageAsSSEGeneric(message []byte) []byte {
+	output := make([]byte, 0, len(message)+512)
+	output = appendClaudeMessageStartAsSSE(output, message)
+	nextIndex := 0
+	for _, block := range collectClaudeRenderableBlocks(message) {
+		output = appendClaudeRenderableBlockAsSSE(output, nextIndex, block)
+		nextIndex++
+	}
+	return appendClaudeMessageEndAsSSE(output, message)
+}
+
+func collectClaudeRenderableBlocks(message []byte) []gjson.Result {
+	content := gjson.GetBytes(message, "content")
+	if !content.IsArray() {
+		return nil
+	}
+	blocks := make([]gjson.Result, 0, len(content.Array()))
+	for _, block := range content.Array() {
+		switch block.Get("type").String() {
+		case "text":
+			if block.Get("text").String() == "" && len(block.Get("citations").Array()) == 0 {
 				continue
 			}
-			hasTextBlock = true
-			if textIndex < 0 {
+		case "thinking":
+			if block.Get("thinking").String() == "" {
 				continue
 			}
-			for _, citation := range block.Get("citations").Array() {
-				citationDelta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"citations_delta","citation":{}}}`, textIndex))
-				citationDelta, _ = sjson.SetRawBytes(citationDelta, "delta.citation", []byte(citation.Raw))
-				output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", citationDelta, 3)
-			}
 		}
-		if hasTextBlock && textIndex >= 0 {
-			emitStop(textIndex)
-		}
-
-		for _, block := range content.Array() {
-			switch block.Get("type").String() {
-			case "server_tool_use":
-				start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"server_tool_use","id":"","name":""}}`, nextIndex))
-				start, _ = sjson.SetBytes(start, "content_block.id", block.Get("id").String())
-				start, _ = sjson.SetBytes(start, "content_block.name", block.Get("name").String())
-				output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
-				if input := block.Get("input"); input.Exists() {
-					delta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, nextIndex))
-					delta, _ = sjson.SetBytes(delta, "delta.partial_json", input.Raw)
-					output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", delta, 3)
-				}
-				emitStop(nextIndex)
-				nextIndex++
-			case "web_search_tool_result":
-				start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"web_search_tool_result","tool_use_id":"","content":[]}}`, nextIndex))
-				start, _ = sjson.SetBytes(start, "content_block.tool_use_id", block.Get("tool_use_id").String())
-				if contentResult := block.Get("content"); contentResult.Exists() {
-					start, _ = sjson.SetRawBytes(start, "content_block.content", []byte(contentResult.Raw))
-				}
-				output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
-				emitStop(nextIndex)
-				nextIndex++
-			}
-		}
+		blocks = append(blocks, block)
 	}
+	return blocks
+}
 
+func appendClaudeMessageStartAsSSE(output, message []byte) []byte {
+	messageStart := []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","content":[],"model":"","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`)
+	messageStart, _ = sjson.SetBytes(messageStart, "message.id", gjson.GetBytes(message, "id").String())
+	messageStart, _ = sjson.SetBytes(messageStart, "message.model", gjson.GetBytes(message, "model").String())
+	return translatorcommon.AppendSSEEventBytes(output, "message_start", messageStart, 3)
+}
+
+func appendClaudeMessageEndAsSSE(output, message []byte) []byte {
 	messageDelta := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 	if stopReason := gjson.GetBytes(message, "stop_reason").String(); stopReason != "" {
 		messageDelta, _ = sjson.SetBytes(messageDelta, "delta.stop_reason", stopReason)
@@ -949,9 +1068,75 @@ func renderClaudeGroundedSearchFinaleAsSSE(message []byte, responseType, respons
 		messageDelta, _ = sjson.SetRawBytes(messageDelta, "usage", []byte(usage.Raw))
 	}
 	output = translatorcommon.AppendSSEEventBytes(output, "message_delta", messageDelta, 3)
-	output = translatorcommon.AppendSSEEventString(output, "message_stop", `{"type":"message_stop"}`, 3)
+	return translatorcommon.AppendSSEEventString(output, "message_stop", `{"type":"message_stop"}`, 3)
+}
 
-	return output
+func appendClaudeRenderableBlockAsSSE(output []byte, index int, block gjson.Result) []byte {
+	switch block.Get("type").String() {
+	case "text":
+		output = appendClaudeTextBlockStartAsSSE(output, index)
+		return appendClaudeTextBlockDeltaAndStopAsSSE(output, index, block)
+	case "thinking":
+		start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, index))
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
+		delta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, index))
+		delta, _ = sjson.SetBytes(delta, "delta.thinking", block.Get("thinking").String())
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", delta, 3)
+	case "tool_use":
+		start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`, index))
+		start, _ = sjson.SetBytes(start, "content_block.id", block.Get("id").String())
+		start, _ = sjson.SetBytes(start, "content_block.name", block.Get("name").String())
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
+		if input := block.Get("input"); input.Exists() {
+			delta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, index))
+			delta, _ = sjson.SetBytes(delta, "delta.partial_json", input.Raw)
+			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", delta, 3)
+		}
+	case "server_tool_use":
+		start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"server_tool_use","id":"","name":""}}`, index))
+		start, _ = sjson.SetBytes(start, "content_block.id", block.Get("id").String())
+		start, _ = sjson.SetBytes(start, "content_block.name", block.Get("name").String())
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
+		if input := block.Get("input"); input.Exists() {
+			delta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, index))
+			delta, _ = sjson.SetBytes(delta, "delta.partial_json", input.Raw)
+			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", delta, 3)
+		}
+	case "web_search_tool_result":
+		start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"web_search_tool_result","tool_use_id":"","content":[]}}`, index))
+		start, _ = sjson.SetBytes(start, "content_block.tool_use_id", block.Get("tool_use_id").String())
+		start, _ = sjson.SetRawBytes(start, "content_block.content", []byte(block.Get("content").Raw))
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
+	case "code_execution_tool_result":
+		start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"code_execution_tool_result","tool_use_id":"","content":{}}}`, index))
+		start, _ = sjson.SetBytes(start, "content_block.tool_use_id", block.Get("tool_use_id").String())
+		start, _ = sjson.SetRawBytes(start, "content_block.content", []byte(block.Get("content").Raw))
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
+	default:
+		return output
+	}
+	stop := []byte(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, index))
+	return translatorcommon.AppendSSEEventBytes(output, "content_block_stop", stop, 3)
+}
+
+func appendClaudeTextBlockStartAsSSE(output []byte, index int) []byte {
+	start := []byte(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, index))
+	return translatorcommon.AppendSSEEventBytes(output, "content_block_start", start, 3)
+}
+
+func appendClaudeTextBlockDeltaAndStopAsSSE(output []byte, index int, block gjson.Result) []byte {
+	if text := block.Get("text").String(); text != "" {
+		delta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, index))
+		delta, _ = sjson.SetBytes(delta, "delta.text", text)
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", delta, 3)
+	}
+	for _, citation := range block.Get("citations").Array() {
+		delta := []byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"citations_delta","citation":{}}}`, index))
+		delta, _ = sjson.SetRawBytes(delta, "delta.citation", []byte(citation.Raw))
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", delta, 3)
+	}
+	stop := []byte(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, index))
+	return translatorcommon.AppendSSEEventBytes(output, "content_block_stop", stop, 3)
 }
 
 func aggregateGeminiBufferedChunks(chunks [][]byte) []byte {
@@ -992,7 +1177,7 @@ func aggregateGeminiBufferedChunks(chunks [][]byte) []byte {
 			// Gemini streams text/thoughts/functionCall args incrementally. Merge adjacent deltas
 			// back into complete parts before translating them as a final Claude message.
 			for _, part := range parts.Array() {
-				if text := part.Get("text"); text.Exists() {
+				if text := part.Get("text"); text.Exists() && text.String() != "" {
 					thought := part.Get("thought").Bool()
 					if len(aggregatedParts) > 0 && aggregatedParts[len(aggregatedParts)-1].Kind == "text" && aggregatedParts[len(aggregatedParts)-1].Thought == thought {
 						aggregatedParts[len(aggregatedParts)-1].Text.WriteString(text.String())
@@ -1016,6 +1201,14 @@ func aggregateGeminiBufferedChunks(chunks [][]byte) []byte {
 						p.Args.WriteString(argsRaw)
 						aggregatedParts = append(aggregatedParts, p)
 					}
+					continue
+				}
+				if geminiExecutableCodePart(part).Exists() {
+					aggregatedParts = append(aggregatedParts, &aggregatedGeminiPart{Kind: "executableCode", Raw: part.Raw})
+					continue
+				}
+				if geminiCodeExecutionResultPart(part).Exists() {
+					aggregatedParts = append(aggregatedParts, &aggregatedGeminiPart{Kind: "codeExecutionResult", Raw: part.Raw})
 				}
 			}
 		}
@@ -1053,6 +1246,8 @@ func aggregateGeminiBufferedChunks(chunks [][]byte) []byte {
 			}
 			partJSON, _ = sjson.SetRawBytes(partJSON, "functionCall.args", normalizeGeminiFunctionArgs(part.Args.String()))
 			out, _ = sjson.SetRawBytes(out, "candidates.0.content.parts.-1", partJSON)
+		case "executableCode", "codeExecutionResult":
+			out, _ = sjson.SetRawBytes(out, "candidates.0.content.parts.-1", []byte(part.Raw))
 		}
 	}
 
@@ -1085,6 +1280,53 @@ func normalizeGeminiFunctionArgs(raw string) []byte {
 	return []byte(`{}`)
 }
 
+func geminiExecutableCodePart(part gjson.Result) gjson.Result {
+	if executableCode := part.Get("executableCode"); executableCode.Exists() {
+		return executableCode
+	}
+	return part.Get("executable_code")
+}
+
+func geminiCodeExecutionResultPart(part gjson.Result) gjson.Result {
+	if codeExecutionResult := part.Get("codeExecutionResult"); codeExecutionResult.Exists() {
+		return codeExecutionResult
+	}
+	return part.Get("code_execution_result")
+}
+
+func buildClaudeCodeExecutionInput(executableCode gjson.Result) []byte {
+	input := []byte(`{}`)
+	if code := executableCode.Get("code").String(); code != "" {
+		input, _ = sjson.SetBytes(input, "code", code)
+	}
+	if language := executableCode.Get("language").String(); language != "" {
+		input, _ = sjson.SetBytes(input, "language", language)
+	}
+	return input
+}
+
+func buildClaudeCodeExecutionResultContent(codeExecutionResult gjson.Result) []byte {
+	outcome := codeExecutionResult.Get("outcome").String()
+	output := codeExecutionResult.Get("output").String()
+
+	content := []byte(`{"type":"code_execution_result","stdout":"","stderr":"","return_code":0}`)
+	switch outcome {
+	case "OUTCOME_OK":
+		content, _ = sjson.SetBytes(content, "stdout", output)
+		content, _ = sjson.SetBytes(content, "return_code", 0)
+	case "OUTCOME_FAILED":
+		content, _ = sjson.SetBytes(content, "stderr", output)
+		content, _ = sjson.SetBytes(content, "return_code", 1)
+	case "OUTCOME_DEADLINE_EXCEEDED":
+		content, _ = sjson.SetBytes(content, "stderr", output)
+		content, _ = sjson.SetBytes(content, "return_code", 124)
+	default:
+		content, _ = sjson.SetBytes(content, "stderr", output)
+		content, _ = sjson.SetBytes(content, "return_code", 1)
+	}
+	return content
+}
+
 func hasClaudeWebSearchRequest(rawJSON []byte) bool {
 	tools := gjson.GetBytes(rawJSON, "tools")
 	if !tools.IsArray() {
@@ -1094,19 +1336,6 @@ func hasClaudeWebSearchRequest(rawJSON []byte) bool {
 		if strings.HasPrefix(tool.Get("type").String(), "web_search_") {
 			return true
 		}
-	}
-	return false
-}
-
-func searchEnabledForGeminiResponse(originalRequestRawJSON, requestRawJSON []byte) bool {
-	// Prefer the translated Gemini request when available because it reflects the final tool
-	// set after Claude tool_choice filtering. Fall back to the original Claude request only
-	// when the translated payload is unavailable.
-	if hasGeminiGoogleSearchRequest(requestRawJSON) {
-		return true
-	}
-	if len(requestRawJSON) == 0 {
-		return hasClaudeWebSearchRequest(originalRequestRawJSON)
 	}
 	return false
 }
@@ -1122,6 +1351,15 @@ func hasGeminiGoogleSearchRequest(rawJSON []byte) bool {
 		}
 	}
 	return false
+}
+
+func shouldBufferEntireGeminiResponse(originalRequestRawJSON, requestRawJSON []byte) bool {
+	// Any request that declares web_search needs the final grounded metadata before we can emit
+	// a Claude-compatible stream with stable block ordering and citations.
+	if len(requestRawJSON) > 0 {
+		return hasGeminiGoogleSearchRequest(requestRawJSON)
+	}
+	return hasClaudeWebSearchRequest(originalRequestRawJSON)
 }
 
 func minInt(a, b int) int {

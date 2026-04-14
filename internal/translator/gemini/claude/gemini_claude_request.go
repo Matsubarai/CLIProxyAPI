@@ -169,8 +169,8 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 	}
 
 	// tools
-	// Parse tool_choice before translating tools because it affects whether Claude web_search
-	// should be exposed to Gemini at all.
+	// Parse tool_choice before translating tools because it affects whether Claude built-in
+	// server tools should be exposed to Gemini at all.
 	toolChoiceResult := gjson.GetBytes(rawJSON, "tool_choice")
 	toolChoiceType := ""
 	toolChoiceName := ""
@@ -182,21 +182,37 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			toolChoiceType = toolChoiceResult.String()
 		}
 	}
-	// Gemini cannot force googleSearch directly. When Claude forces web_search, the closest
-	// equivalent is to keep search available while disabling function calling below.
-	onlySearch := false
+	// Gemini cannot force built-in server tools such as googleSearch/codeExecution directly.
+	// When Claude forces one of them, the closest equivalent is to keep that tool available
+	// while disabling function calling below.
+	onlyServerTool := false
 
 	if toolsResult := gjson.GetBytes(rawJSON, "tools"); toolsResult.IsArray() {
 		functionToolsNode := []byte(`{"functionDeclarations":[]}`)
 		hasGoogleSearch := false
+		hasCodeExecution := false
 		hasFunctionTools := false
 		toolsResult.ForEach(func(_, toolResult gjson.Result) bool {
 			if isClaudeWebSearchTool(toolResult) {
+				// Anthropic exposes web_search as a built-in server tool, while Gemini expects a
+				// dedicated top-level googleSearch tool entry.
 				if shouldIncludeTool(toolResult, toolChoiceType, toolChoiceName) {
 					hasGoogleSearch = true
 				}
 				if toolChoiceType == "tool" && isToolChosen(toolResult, toolChoiceName) {
-					onlySearch = true
+					onlyServerTool = true
+				}
+				return true
+			}
+
+			if isClaudeCodeExecutionTool(toolResult) {
+				// code_execution follows the same pattern as web_search: keep it outside
+				// functionDeclarations so Gemini can route it as a native tool.
+				if shouldIncludeTool(toolResult, toolChoiceType, toolChoiceName) {
+					hasCodeExecution = true
+				}
+				if toolChoiceType == "tool" && isToolChosen(toolResult, toolChoiceName) {
+					onlyServerTool = true
 				}
 				return true
 			}
@@ -229,7 +245,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			return true
 		})
 
-		if hasFunctionTools || hasGoogleSearch {
+		if hasFunctionTools || hasGoogleSearch || hasCodeExecution {
 			toolsNode := []byte(`[]`)
 			if hasFunctionTools {
 				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", functionToolsNode)
@@ -237,6 +253,10 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			if hasGoogleSearch {
 				// Gemini search is declared as its own tool entry rather than a functionDeclaration.
 				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", []byte(`{"googleSearch":{}}`))
+			}
+			if hasCodeExecution {
+				// Gemini code execution is declared as its own tool entry rather than a functionDeclaration.
+				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", []byte(`{"codeExecution":{}}`))
 			}
 			out, _ = sjson.SetRawBytes(out, "tools", toolsNode)
 		}
@@ -252,9 +272,11 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		case "any":
 			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
 		case "tool":
-			if onlySearch {
+			if onlyServerTool {
+				// Gemini cannot force a specific built-in server tool. The closest safe mapping is
+				// to leave the native tool declared and block Gemini function calling entirely.
 				// Keep declared functions untouched, but prevent Gemini from selecting any function
-				// when Claude explicitly forces the built-in web search tool.
+				// when Claude explicitly forces a built-in server tool.
 				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
 			} else {
 				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
@@ -326,6 +348,10 @@ func toolNameFromClaudeToolUseID(toolUseID string) string {
 
 func isClaudeWebSearchTool(toolResult gjson.Result) bool {
 	return strings.HasPrefix(toolResult.Get("type").String(), "web_search")
+}
+
+func isClaudeCodeExecutionTool(toolResult gjson.Result) bool {
+	return strings.HasPrefix(toolResult.Get("type").String(), "code_execution")
 }
 
 func isToolChosen(toolResult gjson.Result, toolChoiceName string) bool {
