@@ -355,6 +355,214 @@ func TestConvertGeminiResponseToOpenAIResponses_ResponseOutputOrdering(t *testin
 	}
 }
 
+func TestConvertGeminiResponseToOpenAIResponses_CodeInterpreterStreamReopensMessage(t *testing.T) {
+	ctx := context.Background()
+	originalReq := []byte(`{
+		"model":"gpt-5",
+		"tools":[{"type":"code_interpreter","container":"container_req"}],
+		"include":["code_interpreter_call.outputs"]
+	}`)
+	requestJSON := ConvertOpenAIResponsesRequestToGemini("gemini-2.5-flash", originalReq, true)
+	chunks := [][]byte{
+		[]byte(`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Let me calculate that."}]}}],"modelVersion":"gemini-2.5-flash","responseId":"resp_code_stream"},"traceId":"t1"}`),
+		[]byte(`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"executableCode":{"language":"PYTHON","code":"print(6 * 7)"}}]}}],"modelVersion":"gemini-2.5-flash","responseId":"resp_code_stream"},"traceId":"t1"}`),
+		[]byte(`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"42\n"}},{"text":"The answer is 42."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":7,"totalTokenCount":16},"modelVersion":"gemini-2.5-flash","responseId":"resp_code_stream"},"traceId":"t1"}`),
+	}
+
+	var param any
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertGeminiResponseToOpenAIResponses(ctx, "gemini-2.5-flash", originalReq, requestJSON, chunk, &param)...)
+	}
+
+	var (
+		messageDoneCount      int
+		firstMessageText      string
+		secondMessageText     string
+		codeAddedPos          = -1
+		codeInProgressPos     = -1
+		codeDeltaPos          = -1
+		codeCodeDonePos       = -1
+		codeInterpretingPos   = -1
+		codeCompletedPos      = -1
+		codeItemDonePos       = -1
+		firstMessageDone      = -1
+		secondMessageAdd      = -1
+		completedPos          = -1
+		codeInterpreterItemID string
+	)
+	for i, chunk := range outputs {
+		ev, data := parseSSEEvent(t, chunk)
+		switch ev {
+		case "response.output_item.added":
+			switch data.Get("item.type").String() {
+			case "code_interpreter_call":
+				if codeAddedPos == -1 {
+					codeAddedPos = i
+				}
+				codeInterpreterItemID = data.Get("item.id").String()
+				if got := data.Get("item.status").String(); got != "in_progress" {
+					t.Fatalf("code_interpreter_call status = %q, want %q: %s", got, "in_progress", data.Raw)
+				}
+				if data.Get("item.code").Exists() {
+					t.Fatalf("did not expect code_interpreter_call code in initial added event: %s", data.Raw)
+				}
+				if got := data.Get("item.container_id").String(); got != "container_req" {
+					t.Fatalf("code_interpreter_call container_id = %q, want %q: %s", got, "container_req", data.Raw)
+				}
+			case "message":
+				if firstMessageDone >= 0 && secondMessageAdd == -1 {
+					secondMessageAdd = i
+				}
+			}
+		case "response.output_item.done":
+			switch data.Get("item.type").String() {
+			case "message":
+				messageDoneCount++
+				if messageDoneCount == 1 {
+					firstMessageDone = i
+					firstMessageText = data.Get("item.content.0.text").String()
+				} else if messageDoneCount == 2 {
+					secondMessageText = data.Get("item.content.0.text").String()
+				}
+			case "code_interpreter_call":
+				codeItemDonePos = i
+				if got := data.Get("item.status").String(); got != "completed" {
+					t.Fatalf("code_interpreter_call done status = %q, want %q: %s", got, "completed", data.Raw)
+				}
+				if got := data.Get("item.code").String(); got != "print(6 * 7)" {
+					t.Fatalf("code_interpreter_call done code = %q, want %q: %s", got, "print(6 * 7)", data.Raw)
+				}
+				if got := data.Get("item.outputs.0.type").String(); got != "logs" {
+					t.Fatalf("code_interpreter_call output type = %q, want %q: %s", got, "logs", data.Raw)
+				}
+				if got := data.Get("item.outputs.0.logs").String(); got != "42\n" {
+					t.Fatalf("code_interpreter_call logs = %q, want %q: %s", got, "42\\n", data.Raw)
+				}
+			}
+		case "response.code_interpreter_call.in_progress":
+			codeInProgressPos = i
+			if got := data.Get("item_id").String(); got != codeInterpreterItemID {
+				t.Fatalf("code_interpreter_call.in_progress item_id = %q, want %q: %s", got, codeInterpreterItemID, data.Raw)
+			}
+		case "response.code_interpreter_call_code.delta":
+			codeDeltaPos = i
+			if got := data.Get("item_id").String(); got != codeInterpreterItemID {
+				t.Fatalf("code_interpreter_call_code.delta item_id = %q, want %q: %s", got, codeInterpreterItemID, data.Raw)
+			}
+			if got := data.Get("delta").String(); got != "print(6 * 7)" {
+				t.Fatalf("code_interpreter_call_code.delta = %q, want %q: %s", got, "print(6 * 7)", data.Raw)
+			}
+		case "response.code_interpreter_call_code.done":
+			codeCodeDonePos = i
+			if got := data.Get("item_id").String(); got != codeInterpreterItemID {
+				t.Fatalf("code_interpreter_call_code.done item_id = %q, want %q: %s", got, codeInterpreterItemID, data.Raw)
+			}
+			if got := data.Get("code").String(); got != "print(6 * 7)" {
+				t.Fatalf("code_interpreter_call_code.done code = %q, want %q: %s", got, "print(6 * 7)", data.Raw)
+			}
+		case "response.code_interpreter_call.interpreting":
+			codeInterpretingPos = i
+			if got := data.Get("item_id").String(); got != codeInterpreterItemID {
+				t.Fatalf("code_interpreter_call.interpreting item_id = %q, want %q: %s", got, codeInterpreterItemID, data.Raw)
+			}
+		case "response.code_interpreter_call.completed":
+			codeCompletedPos = i
+			if got := data.Get("item_id").String(); got != codeInterpreterItemID {
+				t.Fatalf("code_interpreter_call.completed item_id = %q, want %q: %s", got, codeInterpreterItemID, data.Raw)
+			}
+		case "response.completed":
+			completedPos = i
+			if got := data.Get("response.output.0.type").String(); got != "message" {
+				t.Fatalf("response.output[0].type = %q, want %q: %s", got, "message", data.Raw)
+			}
+			if got := data.Get("response.output.1.type").String(); got != "code_interpreter_call" {
+				t.Fatalf("response.output[1].type = %q, want %q: %s", got, "code_interpreter_call", data.Raw)
+			}
+			if got := data.Get("response.output.1.container_id").String(); got != "container_req" {
+				t.Fatalf("response.output[1].container_id = %q, want %q: %s", got, "container_req", data.Raw)
+			}
+			if got := data.Get("response.output.1.outputs.0.logs").String(); got != "42\n" {
+				t.Fatalf("response.output[1].outputs[0].logs = %q, want %q: %s", got, "42\\n", data.Raw)
+			}
+			if got := data.Get("response.output.2.type").String(); got != "message" {
+				t.Fatalf("response.output[2].type = %q, want %q: %s", got, "message", data.Raw)
+			}
+		}
+	}
+
+	if messageDoneCount != 2 {
+		t.Fatalf("messageDoneCount = %d, want 2", messageDoneCount)
+	}
+	if firstMessageText != "Let me calculate that." {
+		t.Fatalf("firstMessageText = %q, want %q", firstMessageText, "Let me calculate that.")
+	}
+	if secondMessageText != "The answer is 42." {
+		t.Fatalf("secondMessageText = %q, want %q", secondMessageText, "The answer is 42.")
+	}
+	if !(firstMessageDone >= 0 && codeAddedPos >= 0 && codeInProgressPos >= 0 && codeDeltaPos >= 0 && codeCodeDonePos >= 0 && codeInterpretingPos >= 0 && codeCompletedPos >= 0 && codeItemDonePos >= 0 && secondMessageAdd >= 0 && completedPos >= 0) {
+		t.Fatalf("missing ordering markers: firstMessageDone=%d codeAdded=%d codeInProgress=%d codeDelta=%d codeCodeDone=%d codeInterpreting=%d codeCompleted=%d codeItemDone=%d secondMessageAdd=%d completed=%d", firstMessageDone, codeAddedPos, codeInProgressPos, codeDeltaPos, codeCodeDonePos, codeInterpretingPos, codeCompletedPos, codeItemDonePos, secondMessageAdd, completedPos)
+	}
+	if !(firstMessageDone < codeAddedPos &&
+		codeAddedPos < codeInProgressPos &&
+		codeInProgressPos < codeDeltaPos &&
+		codeDeltaPos < codeCodeDonePos &&
+		codeCodeDonePos < codeInterpretingPos &&
+		codeInterpretingPos < codeCompletedPos &&
+		codeCompletedPos < codeItemDonePos &&
+		codeItemDonePos < secondMessageAdd &&
+		secondMessageAdd < completedPos) {
+		t.Fatalf("unexpected code interpreter ordering: firstMessageDone=%d codeAdded=%d codeInProgress=%d codeDelta=%d codeCodeDone=%d codeInterpreting=%d codeCompleted=%d codeItemDone=%d secondMessageAdd=%d completed=%d", firstMessageDone, codeAddedPos, codeInProgressPos, codeDeltaPos, codeCodeDonePos, codeInterpretingPos, codeCompletedPos, codeItemDonePos, secondMessageAdd, completedPos)
+	}
+}
+
+func TestConvertGeminiResponseToOpenAIResponsesNonStream_CodeInterpreterOutputsFollowInclude(t *testing.T) {
+	rawJSON := []byte(`{
+		"responseId":"resp_code_nonstream",
+		"modelVersion":"gemini-2.5-flash",
+		"candidates":[{
+			"content":{"role":"model","parts":[
+				{"executableCode":{"language":"PYTHON","code":"print(42)"}},
+				{"codeExecutionResult":{"outcome":"OUTCOME_OK","output":"42\n"}},
+				{"text":"The answer is 42."}
+			]},
+			"finishReason":"STOP"
+		}]
+	}`)
+
+	withoutInclude := []byte(`{
+		"model":"gpt-5",
+		"tools":[{"type":"code_interpreter","container":"container_req"}]
+	}`)
+	withInclude := []byte(`{
+		"model":"gpt-5",
+		"tools":[{"type":"code_interpreter","container":"container_req"}],
+		"include":["code_interpreter_call.outputs"]
+	}`)
+
+	outputWithoutInclude := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "gemini-2.5-flash", withoutInclude, nil, rawJSON, nil)
+	if got := gjson.GetBytes(outputWithoutInclude, "output.0.type").String(); got != "code_interpreter_call" {
+		t.Fatalf("output[0].type = %q, want %q: %s", got, "code_interpreter_call", string(outputWithoutInclude))
+	}
+	if got := gjson.GetBytes(outputWithoutInclude, "output.0.container_id").String(); got != "container_req" {
+		t.Fatalf("output[0].container_id = %q, want %q: %s", got, "container_req", string(outputWithoutInclude))
+	}
+	if gjson.GetBytes(outputWithoutInclude, "output.0.outputs").Exists() {
+		t.Fatalf("did not expect code interpreter outputs without include: %s", string(outputWithoutInclude))
+	}
+	if got := gjson.GetBytes(outputWithoutInclude, "output.1.content.0.text").String(); got != "The answer is 42." {
+		t.Fatalf("output[1].content[0].text = %q, want %q: %s", got, "The answer is 42.", string(outputWithoutInclude))
+	}
+
+	outputWithInclude := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "gemini-2.5-flash", withInclude, nil, rawJSON, nil)
+	if got := gjson.GetBytes(outputWithInclude, "output.0.outputs.0.type").String(); got != "logs" {
+		t.Fatalf("output[0].outputs[0].type = %q, want %q: %s", got, "logs", string(outputWithInclude))
+	}
+	if got := gjson.GetBytes(outputWithInclude, "output.0.outputs.0.logs").String(); got != "42\n" {
+		t.Fatalf("output[0].outputs[0].logs = %q, want %q: %s", got, "42\\n", string(outputWithInclude))
+	}
+}
+
 func TestConvertGeminiResponseToOpenAIResponsesNonStream_GroundingMetadataAddsSearchCallAndAnnotations(t *testing.T) {
 	originalReq := []byte(`{
 		"model":"gpt-5",

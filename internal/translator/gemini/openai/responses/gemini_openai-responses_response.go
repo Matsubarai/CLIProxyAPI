@@ -21,15 +21,18 @@ type geminiToResponsesState struct {
 	Started                 bool
 	SearchMode              bool
 	IncludeWebSearchSources bool
+	IncludeCodeOutputs      bool
+	ContainerHint           string
 
 	// message aggregation
-	MsgOpened      bool
-	MsgClosed      bool
-	MsgIndex       int
-	CurrentMsgID   string
-	TextBuf        strings.Builder
-	ItemTextBuf    strings.Builder
-	MsgAnnotations [][]byte
+	MsgOpened             bool
+	MsgClosed             bool
+	MsgIndex              int
+	CurrentMsgID          string
+	TextBuf               strings.Builder
+	ItemTextBuf           strings.Builder
+	MsgAnnotations        [][]byte
+	CompletedMessageItems map[int][]byte
 
 	// reasoning aggregation
 	ReasoningOpened bool
@@ -45,11 +48,26 @@ type geminiToResponsesState struct {
 	FuncNames        map[int]string
 	FuncCallIDs      map[int]string
 	FuncDone         map[int]bool
+	CodeCalls        map[int]*responsesCodeInterpreterCallState
+	ActiveCodeCall   int
 	SanitizedNameMap map[string]string
 
 	SearchCallIndex int
 	SearchCallRaw   []byte
 	SearchCallDone  bool
+}
+
+type responsesCodeInterpreterCallState struct {
+	ItemID       string
+	Code         string
+	ContainerID  string
+	Status       string
+	OutputsRaw   []byte
+	Done         bool
+	InProgress   bool
+	CodeDone     bool
+	Interpreting bool
+	Completed    bool
 }
 
 // responseIDCounter provides a process-wide unique counter for synthesized response identifiers.
@@ -100,17 +118,25 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 	if *param == nil {
 		searchMode := requestDeclaresResponsesWebSearch(originalRequestRawJSON, requestRawJSON)
 		*param = &geminiToResponsesState{
+			CompletedMessageItems:   make(map[int][]byte),
 			FuncArgsBuf:             make(map[int]*strings.Builder),
 			FuncNames:               make(map[int]string),
 			FuncCallIDs:             make(map[int]string),
 			FuncDone:                make(map[int]bool),
+			CodeCalls:               make(map[int]*responsesCodeInterpreterCallState),
+			ActiveCodeCall:          -1,
 			SanitizedNameMap:        util.SanitizedToolNameMap(originalRequestRawJSON),
 			SearchMode:              searchMode,
 			IncludeWebSearchSources: shouldIncludeResponsesWebSearchSources(originalRequestRawJSON, requestRawJSON),
+			IncludeCodeOutputs:      shouldIncludeResponsesCodeInterpreterOutputs(originalRequestRawJSON, requestRawJSON),
+			ContainerHint:           responsesCodeInterpreterContainerHint(originalRequestRawJSON, requestRawJSON),
 			SearchCallIndex:         -1,
 		}
 	}
 	st := (*param).(*geminiToResponsesState)
+	if st.CompletedMessageItems == nil {
+		st.CompletedMessageItems = make(map[int][]byte)
+	}
 	if st.FuncArgsBuf == nil {
 		st.FuncArgsBuf = make(map[int]*strings.Builder)
 	}
@@ -122,6 +148,12 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 	}
 	if st.FuncDone == nil {
 		st.FuncDone = make(map[int]bool)
+	}
+	if st.CodeCalls == nil {
+		st.CodeCalls = make(map[int]*responsesCodeInterpreterCallState)
+	}
+	if st.ActiveCodeCall == 0 && len(st.CodeCalls) == 0 {
+		st.ActiveCodeCall = -1
 	}
 	if st.SanitizedNameMap == nil {
 		st.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
@@ -215,20 +247,153 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 			}
 		}
 		out = append(out, emitEvent("response.content_part.done", partDone))
-		final := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}}`)
-		final, _ = sjson.SetBytes(final, "sequence_number", nextSeq())
-		final, _ = sjson.SetBytes(final, "output_index", st.MsgIndex)
-		final, _ = sjson.SetBytes(final, "item.id", st.CurrentMsgID)
-		final, _ = sjson.SetBytes(final, "item.content.0.text", fullText)
+		finalItem := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
+		finalItem, _ = sjson.SetBytes(finalItem, "id", st.CurrentMsgID)
+		finalItem, _ = sjson.SetBytes(finalItem, "content.0.text", fullText)
 		if len(st.MsgAnnotations) > 0 {
-			final, _ = sjson.SetRawBytes(final, "item.content.0.annotations", []byte(`[]`))
+			finalItem, _ = sjson.SetRawBytes(finalItem, "content.0.annotations", []byte(`[]`))
 			for _, annotation := range st.MsgAnnotations {
-				final, _ = sjson.SetRawBytes(final, "item.content.0.annotations.-1", annotation)
+				finalItem, _ = sjson.SetRawBytes(finalItem, "content.0.annotations.-1", annotation)
 			}
 		}
+		final := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{}}`)
+		final, _ = sjson.SetBytes(final, "sequence_number", nextSeq())
+		final, _ = sjson.SetBytes(final, "output_index", st.MsgIndex)
+		final, _ = sjson.SetRawBytes(final, "item", finalItem)
 		out = append(out, emitEvent("response.output_item.done", final))
 
-		st.MsgClosed = true
+		st.CompletedMessageItems[st.MsgIndex] = append([]byte(nil), finalItem...)
+
+		st.MsgOpened = false
+		st.MsgClosed = false
+		st.CurrentMsgID = ""
+		st.ItemTextBuf.Reset()
+		st.MsgAnnotations = nil
+	}
+
+	emitCodeCallStateEvent := func(eventName string, idx int, itemID string) {
+		event := []byte(`{"type":"","sequence_number":0,"output_index":0,"item_id":""}`)
+		event, _ = sjson.SetBytes(event, "type", eventName)
+		event, _ = sjson.SetBytes(event, "sequence_number", nextSeq())
+		event, _ = sjson.SetBytes(event, "output_index", idx)
+		event, _ = sjson.SetBytes(event, "item_id", itemID)
+		out = append(out, emitEvent(eventName, event))
+	}
+
+	emitCodeCallCodeDelta := func(idx int, itemID string, code string) {
+		if code == "" {
+			return
+		}
+		event := []byte(`{"type":"response.code_interpreter_call_code.delta","sequence_number":0,"output_index":0,"item_id":"","delta":""}`)
+		event, _ = sjson.SetBytes(event, "sequence_number", nextSeq())
+		event, _ = sjson.SetBytes(event, "output_index", idx)
+		event, _ = sjson.SetBytes(event, "item_id", itemID)
+		event, _ = sjson.SetBytes(event, "delta", code)
+		out = append(out, emitEvent("response.code_interpreter_call_code.delta", event))
+	}
+
+	emitCodeCallCodeDone := func(idx int, itemID string, code string) {
+		if code == "" {
+			return
+		}
+		event := []byte(`{"type":"response.code_interpreter_call_code.done","sequence_number":0,"output_index":0,"item_id":"","code":""}`)
+		event, _ = sjson.SetBytes(event, "sequence_number", nextSeq())
+		event, _ = sjson.SetBytes(event, "output_index", idx)
+		event, _ = sjson.SetBytes(event, "item_id", itemID)
+		event, _ = sjson.SetBytes(event, "code", code)
+		out = append(out, emitEvent("response.code_interpreter_call_code.done", event))
+	}
+
+	buildCodeCallItem := func(call *responsesCodeInterpreterCallState) []byte {
+		itemJSON := []byte(`{"id":"","type":"code_interpreter_call","status":"","code":null,"container_id":""}`)
+		itemJSON, _ = sjson.SetBytes(itemJSON, "id", call.ItemID)
+		itemJSON, _ = sjson.SetBytes(itemJSON, "status", call.Status)
+		itemJSON, _ = sjson.SetBytes(itemJSON, "container_id", call.ContainerID)
+		if call.Code != "" {
+			itemJSON, _ = sjson.SetBytes(itemJSON, "code", call.Code)
+		}
+		if len(call.OutputsRaw) > 0 {
+			itemJSON, _ = sjson.SetRawBytes(itemJSON, "outputs", call.OutputsRaw)
+		}
+		return itemJSON
+	}
+
+	ensureCodeCall := func() (int, *responsesCodeInterpreterCallState) {
+		if st.ActiveCodeCall >= 0 {
+			if active := st.CodeCalls[st.ActiveCodeCall]; active != nil && !active.Done {
+				return st.ActiveCodeCall, active
+			}
+		}
+
+		idx := st.NextIndex
+		st.NextIndex++
+		call := &responsesCodeInterpreterCallState{
+			ItemID:      responsesCodeInterpreterItemID(st.ResponseID, idx),
+			ContainerID: responsesCodeInterpreterResolvedContainerID(st.ResponseID, idx, st.ContainerHint),
+			Status:      "in_progress",
+		}
+		st.CodeCalls[idx] = call
+		st.ActiveCodeCall = idx
+
+		item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"code_interpreter_call","status":"in_progress","container_id":""}}`)
+		item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
+		item, _ = sjson.SetBytes(item, "output_index", idx)
+		item, _ = sjson.SetBytes(item, "item.id", call.ItemID)
+		item, _ = sjson.SetBytes(item, "item.status", call.Status)
+		item, _ = sjson.SetBytes(item, "item.container_id", call.ContainerID)
+		out = append(out, emitEvent("response.output_item.added", item))
+		emitCodeCallStateEvent("response.code_interpreter_call.in_progress", idx, call.ItemID)
+		call.InProgress = true
+		return idx, call
+	}
+
+	emitCodeCallCode := func(idx int, call *responsesCodeInterpreterCallState, code string) {
+		if call == nil || code == "" {
+			return
+		}
+		call.Code = code
+		emitCodeCallCodeDelta(idx, call.ItemID, code)
+		emitCodeCallCodeDone(idx, call.ItemID, code)
+		call.CodeDone = true
+	}
+
+	finalizeCodeCall := func(idx int, status string, outputsRaw []byte, emitCompletionEvents bool) {
+		call := st.CodeCalls[idx]
+		if call == nil || call.Done {
+			return
+		}
+		if status == "" {
+			status = call.Status
+		}
+		call.Status = status
+		if st.IncludeCodeOutputs && len(outputsRaw) > 0 {
+			call.OutputsRaw = append([]byte(nil), outputsRaw...)
+		} else {
+			call.OutputsRaw = nil
+		}
+
+		if emitCompletionEvents {
+			if !call.Interpreting {
+				emitCodeCallStateEvent("response.code_interpreter_call.interpreting", idx, call.ItemID)
+				call.Interpreting = true
+			}
+			if !call.Completed {
+				emitCodeCallStateEvent("response.code_interpreter_call.completed", idx, call.ItemID)
+				call.Completed = true
+			}
+		}
+		itemJSON := buildCodeCallItem(call)
+
+		done := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{}}`)
+		done, _ = sjson.SetBytes(done, "sequence_number", nextSeq())
+		done, _ = sjson.SetBytes(done, "output_index", idx)
+		done, _ = sjson.SetRawBytes(done, "item", itemJSON)
+		out = append(out, emitEvent("response.output_item.done", done))
+
+		call.Done = true
+		if st.ActiveCodeCall == idx {
+			st.ActiveCodeCall = -1
+		}
 	}
 
 	emitSearchCall := func() {
@@ -352,11 +517,15 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 			if t := part.Get("text"); t.Exists() && t.String() != "" {
 				// Before emitting non-reasoning outputs, finalize reasoning if open.
 				finalizeReasoning()
+				if st.ActiveCodeCall >= 0 {
+					finalizeCodeCall(st.ActiveCodeCall, "incomplete", nil, false)
+				}
 				if !st.MsgOpened {
 					st.MsgOpened = true
+					st.MsgClosed = false
 					st.MsgIndex = st.NextIndex
 					st.NextIndex++
-					st.CurrentMsgID = fmt.Sprintf("msg_%s_0", st.ResponseID)
+					st.CurrentMsgID = responsesMessageItemID(st.ResponseID, st.MsgIndex)
 					item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
 					item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
 					item, _ = sjson.SetBytes(item, "output_index", st.MsgIndex)
@@ -380,12 +549,34 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				return true
 			}
 
+			if executableCode := geminiExecutableCodePart(part); executableCode.Exists() {
+				finalizeReasoning()
+				finalizeMessage()
+				if st.ActiveCodeCall >= 0 {
+					finalizeCodeCall(st.ActiveCodeCall, "incomplete", nil, false)
+				}
+				idx, call := ensureCodeCall()
+				emitCodeCallCode(idx, call, executableCode.Get("code").String())
+				return true
+			}
+
+			if codeExecutionResult := geminiCodeExecutionResultPart(part); codeExecutionResult.Exists() {
+				finalizeReasoning()
+				finalizeMessage()
+				idx, _ := ensureCodeCall()
+				finalizeCodeCall(idx, responsesCodeInterpreterStatus(codeExecutionResult.Get("outcome").String()), buildResponsesCodeInterpreterOutputs(codeExecutionResult), true)
+				return true
+			}
+
 			// Function call
 			if fc := part.Get("functionCall"); fc.Exists() {
 				// Before emitting function-call outputs, finalize reasoning and the message (if open).
 				// Responses streaming requires message done events before the next output_item.added.
 				finalizeReasoning()
 				finalizeMessage()
+				if st.ActiveCodeCall >= 0 {
+					finalizeCodeCall(st.ActiveCodeCall, "incomplete", nil, false)
+				}
 				name := util.RestoreSanitizedToolName(st.SanitizedNameMap, fc.Get("name").String())
 				idx := st.NextIndex
 				st.NextIndex++
@@ -473,12 +664,18 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		emitSearchCall()
 		finalizeMessage()
 
-		// Close function calls
-		if len(st.FuncArgsBuf) > 0 {
-			// sort indices (small N); avoid extra imports
-			idxs := make([]int, 0, len(st.FuncArgsBuf))
+		// Close any unfinished tool outputs in output_index order.
+		if len(st.FuncArgsBuf) > 0 || len(st.CodeCalls) > 0 {
+			idxs := make([]int, 0, len(st.FuncArgsBuf)+len(st.CodeCalls))
+			for idx, call := range st.CodeCalls {
+				if call != nil && !call.Done {
+					idxs = append(idxs, idx)
+				}
+			}
 			for idx := range st.FuncArgsBuf {
-				idxs = append(idxs, idx)
+				if !st.FuncDone[idx] {
+					idxs = append(idxs, idx)
+				}
 			}
 			for i := 0; i < len(idxs); i++ {
 				for j := i + 1; j < len(idxs); j++ {
@@ -488,6 +685,10 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				}
 			}
 			for _, idx := range idxs {
+				if call := st.CodeCalls[idx]; call != nil && !call.Done {
+					finalizeCodeCall(idx, "incomplete", nil, false)
+					continue
+				}
 				if st.FuncDone[idx] {
 					continue
 				}
@@ -598,10 +799,14 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 				continue
 			}
-			if st.MsgOpened && idx == st.MsgIndex {
+			if item, ok := st.CompletedMessageItems[idx]; ok && len(item) > 0 {
+				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+				continue
+			}
+			if st.MsgOpened && idx == st.MsgIndex && st.ItemTextBuf.Len() > 0 {
 				item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 				item, _ = sjson.SetBytes(item, "id", st.CurrentMsgID)
-				item, _ = sjson.SetBytes(item, "content.0.text", st.TextBuf.String())
+				item, _ = sjson.SetBytes(item, "content.0.text", st.ItemTextBuf.String())
 				if len(st.MsgAnnotations) > 0 {
 					item, _ = sjson.SetRawBytes(item, "content.0.annotations", []byte(`[]`))
 					for _, annotation := range st.MsgAnnotations {
@@ -613,6 +818,10 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 			}
 			if len(st.SearchCallRaw) > 0 && idx == st.SearchCallIndex {
 				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", st.SearchCallRaw)
+				continue
+			}
+			if call := st.CodeCalls[idx]; call != nil {
+				outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", buildCodeCallItem(call))
 				continue
 			}
 
@@ -767,8 +976,13 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	var reasoningText strings.Builder
 	var reasoningEncrypted string
 	var messageText strings.Builder
-	var haveMessage bool
-	functionOutputs := make([][]byte, 0)
+	deferredOutputs := make([][]byte, 0)
+	groundingMetadata := root.Get("candidates.0.groundingMetadata")
+	includeCodeOutputs := shouldIncludeResponsesCodeInterpreterOutputs(originalRequestRawJSON, requestRawJSON)
+	containerHint := responsesCodeInterpreterContainerHint(originalRequestRawJSON, requestRawJSON)
+	messageIndex := 0
+	codeCallIndex := 0
+	var pendingCodeCall *responsesCodeInterpreterCallState
 
 	haveOutput := false
 	ensureOutput := func() {
@@ -781,6 +995,50 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 	appendOutput := func(itemJSON []byte) {
 		ensureOutput()
 		resp, _ = sjson.SetRawBytes(resp, "output.-1", itemJSON)
+	}
+	queueOutput := func(itemJSON []byte) {
+		deferredOutputs = append(deferredOutputs, append([]byte(nil), itemJSON...))
+	}
+	flushMessage := func() {
+		if messageText.Len() == 0 {
+			return
+		}
+		itemJSON := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
+		itemJSON, _ = sjson.SetBytes(itemJSON, "id", responsesMessageItemID(id, messageIndex))
+		itemJSON, _ = sjson.SetBytes(itemJSON, "content.0.text", messageText.String())
+		messageAnnotations := buildResponsesAnnotationsFromGroundingMetadata(messageText.String(), groundingMetadata)
+		if len(messageAnnotations) > 0 {
+			itemJSON, _ = sjson.SetRawBytes(itemJSON, "content.0.annotations", []byte(`[]`))
+			for _, annotation := range messageAnnotations {
+				itemJSON, _ = sjson.SetRawBytes(itemJSON, "content.0.annotations.-1", annotation)
+			}
+		}
+		queueOutput(itemJSON)
+		messageIndex++
+		messageText.Reset()
+	}
+	flushPendingCodeCall := func(status string) {
+		if pendingCodeCall == nil {
+			return
+		}
+		if status != "" {
+			pendingCodeCall.Status = status
+		}
+		if pendingCodeCall.Status == "" {
+			pendingCodeCall.Status = "incomplete"
+		}
+		itemJSON := []byte(`{"id":"","type":"code_interpreter_call","status":"","code":null,"container_id":""}`)
+		itemJSON, _ = sjson.SetBytes(itemJSON, "id", pendingCodeCall.ItemID)
+		itemJSON, _ = sjson.SetBytes(itemJSON, "status", pendingCodeCall.Status)
+		itemJSON, _ = sjson.SetBytes(itemJSON, "container_id", pendingCodeCall.ContainerID)
+		if pendingCodeCall.Code != "" {
+			itemJSON, _ = sjson.SetBytes(itemJSON, "code", pendingCodeCall.Code)
+		}
+		if len(pendingCodeCall.OutputsRaw) > 0 {
+			itemJSON, _ = sjson.SetRawBytes(itemJSON, "outputs", pendingCodeCall.OutputsRaw)
+		}
+		queueOutput(itemJSON)
+		pendingCodeCall = nil
 	}
 
 	if parts := root.Get("candidates.0.content.parts"); parts.Exists() && parts.IsArray() {
@@ -796,10 +1054,39 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			}
 			if t := p.Get("text"); t.Exists() && t.String() != "" {
 				messageText.WriteString(t.String())
-				haveMessage = true
+				return true
+			}
+			if executableCode := geminiExecutableCodePart(p); executableCode.Exists() {
+				flushMessage()
+				flushPendingCodeCall("incomplete")
+				pendingCodeCall = &responsesCodeInterpreterCallState{
+					ItemID:      responsesCodeInterpreterItemID(id, codeCallIndex),
+					Code:        executableCode.Get("code").String(),
+					ContainerID: responsesCodeInterpreterResolvedContainerID(id, codeCallIndex, containerHint),
+					Status:      "interpreting",
+				}
+				codeCallIndex++
+				return true
+			}
+			if codeExecutionResult := geminiCodeExecutionResultPart(p); codeExecutionResult.Exists() {
+				flushMessage()
+				if pendingCodeCall == nil {
+					pendingCodeCall = &responsesCodeInterpreterCallState{
+						ItemID:      responsesCodeInterpreterItemID(id, codeCallIndex),
+						ContainerID: responsesCodeInterpreterResolvedContainerID(id, codeCallIndex, containerHint),
+					}
+					codeCallIndex++
+				}
+				pendingCodeCall.Status = responsesCodeInterpreterStatus(codeExecutionResult.Get("outcome").String())
+				if includeCodeOutputs {
+					pendingCodeCall.OutputsRaw = buildResponsesCodeInterpreterOutputs(codeExecutionResult)
+				}
+				flushPendingCodeCall("")
 				return true
 			}
 			if fc := p.Get("functionCall"); fc.Exists() {
+				flushMessage()
+				flushPendingCodeCall("incomplete")
 				name := util.RestoreSanitizedToolName(sanitizedNameMap, fc.Get("name").String())
 				args := fc.Get("args")
 				callID := fmt.Sprintf("call_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&funcCallIDCounter, 1))
@@ -812,12 +1099,13 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					argsStr = args.Raw
 				}
 				itemJSON, _ = sjson.SetBytes(itemJSON, "arguments", argsStr)
-				functionOutputs = append(functionOutputs, itemJSON)
+				queueOutput(itemJSON)
 				return true
 			}
 			return true
 		})
 	}
+	flushPendingCodeCall("incomplete")
 
 	// Reasoning output item
 	if reasoningText.Len() > 0 || reasoningEncrypted != "" {
@@ -834,26 +1122,12 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		appendOutput(itemJSON)
 	}
 
-	groundingMetadata := root.Get("candidates.0.groundingMetadata")
 	if searchCall := buildResponsesWebSearchCallItem(id, originalRequestRawJSON, requestRawJSON, groundingMetadata, includeSearchSources); len(searchCall) > 0 {
 		appendOutput(searchCall)
 	}
-	// Assistant message output item
-	messageAnnotations := buildResponsesAnnotationsFromGroundingMetadata(messageText.String(), groundingMetadata)
-	if haveMessage {
-		itemJSON := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
-		itemJSON, _ = sjson.SetBytes(itemJSON, "id", fmt.Sprintf("msg_%s_0", strings.TrimPrefix(id, "resp_")))
-		itemJSON, _ = sjson.SetBytes(itemJSON, "content.0.text", messageText.String())
-		if len(messageAnnotations) > 0 {
-			itemJSON, _ = sjson.SetRawBytes(itemJSON, "content.0.annotations", []byte(`[]`))
-			for _, annotation := range messageAnnotations {
-				itemJSON, _ = sjson.SetRawBytes(itemJSON, "content.0.annotations.-1", annotation)
-			}
-		}
+	flushMessage()
+	for _, itemJSON := range deferredOutputs {
 		appendOutput(itemJSON)
-	}
-	for _, functionOutput := range functionOutputs {
-		appendOutput(functionOutput)
 	}
 
 	// usage mapping
@@ -929,4 +1203,98 @@ func shouldIncludeResponsesWebSearchSources(originalRequestRawJSON, requestRawJS
 		}
 	}
 	return false
+}
+
+func shouldIncludeResponsesCodeInterpreterOutputs(originalRequestRawJSON, requestRawJSON []byte) bool {
+	reqJSON := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+	if len(reqJSON) == 0 {
+		return false
+	}
+	req := unwrapRequestRoot(gjson.ParseBytes(reqJSON))
+	include := req.Get("include")
+	if !include.IsArray() {
+		return false
+	}
+	for _, item := range include.Array() {
+		if item.String() == "code_interpreter_call.outputs" {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesCodeInterpreterContainerHint(originalRequestRawJSON, requestRawJSON []byte) string {
+	reqJSON := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+	if len(reqJSON) == 0 {
+		return ""
+	}
+	req := unwrapRequestRoot(gjson.ParseBytes(reqJSON))
+	tools := req.Get("tools")
+	if !tools.IsArray() {
+		return ""
+	}
+	for _, tool := range tools.Array() {
+		if !isResponsesCodeInterpreterTool(tool) {
+			continue
+		}
+		container := tool.Get("container")
+		if container.Type == gjson.String {
+			return strings.TrimSpace(container.String())
+		}
+	}
+	return ""
+}
+
+func responsesMessageItemID(responseID string, index int) string {
+	return fmt.Sprintf("msg_%s_%d", strings.TrimPrefix(responseID, "resp_"), index)
+}
+
+func responsesCodeInterpreterItemID(responseID string, index int) string {
+	return fmt.Sprintf("ci_%s_%d", strings.TrimPrefix(responseID, "resp_"), index)
+}
+
+func responsesCodeInterpreterResolvedContainerID(responseID string, index int, hint string) string {
+	if trimmed := strings.TrimSpace(hint); trimmed != "" {
+		return trimmed
+	}
+	return fmt.Sprintf("container_%s_%d", strings.TrimPrefix(responseID, "resp_"), index)
+}
+
+func geminiExecutableCodePart(part gjson.Result) gjson.Result {
+	if executableCode := part.Get("executableCode"); executableCode.Exists() {
+		return executableCode
+	}
+	return part.Get("executable_code")
+}
+
+func geminiCodeExecutionResultPart(part gjson.Result) gjson.Result {
+	if codeExecutionResult := part.Get("codeExecutionResult"); codeExecutionResult.Exists() {
+		return codeExecutionResult
+	}
+	return part.Get("code_execution_result")
+}
+
+func responsesCodeInterpreterStatus(outcome string) string {
+	switch outcome {
+	case "OUTCOME_OK":
+		return "completed"
+	case "OUTCOME_DEADLINE_EXCEEDED":
+		return "incomplete"
+	case "OUTCOME_FAILED":
+		return "failed"
+	default:
+		return "failed"
+	}
+}
+
+func buildResponsesCodeInterpreterOutputs(codeExecutionResult gjson.Result) []byte {
+	output := codeExecutionResult.Get("output").String()
+	if output == "" {
+		return nil
+	}
+	outputs := []byte(`[]`)
+	logs := []byte(`{"type":"logs","logs":""}`)
+	logs, _ = sjson.SetBytes(logs, "logs", output)
+	outputs, _ = sjson.SetRawBytes(outputs, "-1", logs)
+	return outputs
 }

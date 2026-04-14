@@ -86,3 +86,51 @@ func TestOpenAIResponsesToGemini_TranslatesWebSearchToGoogleSearch(t *testing.T)
 		t.Fatalf("did not expect search_context_size to be forwarded: %s", string(out))
 	}
 }
+
+func TestOpenAIResponsesToGemini_MapsDeveloperRoleToSystemInstruction(t *testing.T) {
+	in := []byte(`{
+		"model":"gpt-5",
+		"instructions":"baseline policy",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"reply tersely"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+
+	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatGemini, "gemini-2.5-flash", in, false)
+
+	if got := gjson.GetBytes(out, "systemInstruction.parts.0.text").String(); got != "baseline policy" {
+		t.Fatalf("expected systemInstruction.parts[0].text=baseline policy, got %q: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "systemInstruction.parts.1.text").String(); got != "reply tersely" {
+		t.Fatalf("expected systemInstruction.parts[1].text=reply tersely, got %q: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "contents.0.role").String(); got != "user" {
+		t.Fatalf("expected contents[0].role=user, got %q: %s", got, string(out))
+	}
+	for _, content := range gjson.GetBytes(out, "contents").Array() {
+		if got := content.Get("role").String(); got == "developer" {
+			t.Fatalf("did not expect Gemini contents role=developer: %s", string(out))
+		}
+	}
+}
+
+func TestOpenAIResponsesToGemini_TranslatesCodeInterpreterToCodeExecution(t *testing.T) {
+	in := []byte(`{
+		"model":"gpt-5",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"run python"}]}],
+		"tools":[{"type":"code_interpreter","container":"container_123"}]
+	}`)
+
+	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatGemini, "gemini-2.5-flash", in, false)
+
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("expected 1 tool, got %d: %s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "tools.0.codeExecution").Exists() {
+		t.Fatalf("expected tools[0].codeExecution to exist: %s", string(out))
+	}
+	if gjson.GetBytes(out, "tools.0.codeExecution.container").Exists() {
+		t.Fatalf("did not expect code interpreter container config to be forwarded: %s", string(out))
+	}
+}

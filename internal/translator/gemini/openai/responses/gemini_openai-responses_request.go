@@ -26,6 +26,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	toolChoice := root.Get("tool_choice")
 	toolChoiceType := normalizedResponsesToolChoiceType(toolChoice)
 	forceWebSearch := isResponsesWebSearchChoiceType(toolChoiceType)
+	forceCodeInterpreter := isResponsesCodeInterpreterChoiceType(toolChoiceType)
 
 	// Extract system instruction from OpenAI "instructions" field
 	if instructions := root.Get("instructions"); instructions.Exists() {
@@ -121,7 +122,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 			switch itemType {
 			case "message":
-				if strings.EqualFold(itemRole, "system") {
+				if isResponsesSystemInstructionRole(itemRole) {
 					if contentArray := item.Get("content"); contentArray.Exists() {
 						systemInstr := []byte(`{"parts":[]}`)
 						if systemInstructionResult := gjson.GetBytes(out, "systemInstruction"); systemInstructionResult.Exists() {
@@ -375,11 +376,18 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	functionTools := []byte(`{"functionDeclarations":[]}`)
 	hasFunctionTools := false
 	hasGoogleSearch := false
+	hasCodeExecution := false
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			if isResponsesWebSearchTool(tool) {
 				if toolChoiceType != "none" {
 					hasGoogleSearch = true
+				}
+				return true
+			}
+			if isResponsesCodeInterpreterTool(tool) {
+				if toolChoiceType != "none" {
+					hasCodeExecution = true
 				}
 				return true
 			}
@@ -408,8 +416,11 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	if forceWebSearch && toolChoiceType != "none" {
 		hasGoogleSearch = true
 	}
+	if forceCodeInterpreter && toolChoiceType != "none" {
+		hasCodeExecution = true
+	}
 
-	if hasFunctionTools || hasGoogleSearch {
+	if hasFunctionTools || hasGoogleSearch || hasCodeExecution {
 		geminiTools := []byte(`[]`)
 		if hasFunctionTools {
 			geminiTools, _ = sjson.SetRawBytes(geminiTools, "-1", functionTools)
@@ -417,10 +428,13 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 		if hasGoogleSearch {
 			geminiTools, _ = sjson.SetRawBytes(geminiTools, "-1", []byte(`{"googleSearch":{}}`))
 		}
+		if hasCodeExecution {
+			geminiTools, _ = sjson.SetRawBytes(geminiTools, "-1", []byte(`{"codeExecution":{}}`))
+		}
 		out, _ = sjson.SetRawBytes(out, "tools", geminiTools)
 	}
 
-	if toolChoiceType == "none" || (forceWebSearch && hasFunctionTools) {
+	if toolChoiceType == "none" || ((forceWebSearch || forceCodeInterpreter) && hasFunctionTools) {
 		out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
 	}
 
@@ -486,6 +500,14 @@ func isResponsesWebSearchTool(tool gjson.Result) bool {
 	return isResponsesWebSearchChoiceType(normalizeResponsesBuiltinToolType(tool.Get("type").String()))
 }
 
+func isResponsesCodeInterpreterTool(tool gjson.Result) bool {
+	return isResponsesCodeInterpreterChoiceType(normalizeResponsesBuiltinToolType(tool.Get("type").String()))
+}
+
+func isResponsesSystemInstructionRole(role string) bool {
+	return strings.EqualFold(role, "system") || strings.EqualFold(role, "developer")
+}
+
 func normalizedResponsesToolChoiceType(toolChoice gjson.Result) string {
 	if !toolChoice.Exists() {
 		return ""
@@ -513,4 +535,8 @@ func normalizeResponsesBuiltinToolType(toolType string) string {
 
 func isResponsesWebSearchChoiceType(toolType string) bool {
 	return strings.HasPrefix(toolType, "web_search")
+}
+
+func isResponsesCodeInterpreterChoiceType(toolType string) bool {
+	return toolType == "code_interpreter"
 }
